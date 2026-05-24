@@ -2,6 +2,7 @@ package backends
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -60,6 +61,60 @@ func (mb *MockBackend) StreamTokens(ctx context.Context, req *harness.Completion
 		defer close(tokenChan)
 
 		words := strings.Fields(mb.response)
+		for _, word := range words {
+			select {
+			case <-ctx.Done():
+				return
+			case tokenChan <- word + " ":
+				time.Sleep(mb.tokenDelay)
+			}
+		}
+	}()
+
+	return tokenChan, nil
+}
+
+// Chat implements harness.LLMProvider
+func (mb *MockBackend) Chat(ctx context.Context, req *harness.ChatRequest) (*harness.ChatResponse, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Echo the last user message for testing
+	lastMsg := ""
+	for _, m := range req.Messages {
+		if m.Role == "user" {
+			lastMsg = m.Content
+		}
+	}
+	text := fmt.Sprintf("[mock] You said: %q — %s", lastMsg, mb.response)
+
+	return &harness.ChatResponse{
+		Message:      harness.ChatMessage{Role: "assistant", Content: text},
+		FinishReason: "stop",
+		TokensUsed:   len(strings.Fields(text)),
+		Model:        mb.model,
+	}, nil
+}
+
+// StreamChat implements harness.LLMProvider
+func (mb *MockBackend) StreamChat(ctx context.Context, req *harness.ChatRequest) (<-chan string, error) {
+	tokenChan := make(chan string)
+
+	go func() {
+		defer close(tokenChan)
+
+		lastMsg := ""
+		for _, m := range req.Messages {
+			if m.Role == "user" {
+				lastMsg = m.Content
+			}
+		}
+		text := fmt.Sprintf("[mock] You said: %q — %s", lastMsg, mb.response)
+
+		words := strings.Fields(text)
 		for _, word := range words {
 			select {
 			case <-ctx.Done():

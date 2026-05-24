@@ -110,6 +110,57 @@ func (hb *HuggingFaceBackend) StreamTokens(ctx context.Context, req *harness.Com
 	return tokenChan, nil
 }
 
+// Chat implements harness.LLMProvider — formats message history as a prompt and delegates to Complete
+func (hb *HuggingFaceBackend) Chat(ctx context.Context, req *harness.ChatRequest) (*harness.ChatResponse, error) {
+	prompt := messagesAsPrompt(req.Messages)
+	resp, err := hb.Complete(ctx, &harness.CompletionRequest{
+		Prompt:      prompt,
+		Temperature: req.Temperature,
+		MaxTokens:   req.MaxTokens,
+		Model:       req.Model,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &harness.ChatResponse{
+		Message:      harness.ChatMessage{Role: "assistant", Content: resp.Text},
+		FinishReason: resp.FinishReason,
+		TokensUsed:   resp.TokensUsed,
+		Model:        resp.Model,
+	}, nil
+}
+
+// StreamChat implements harness.LLMProvider — formats message history as a prompt and delegates to StreamTokens
+func (hb *HuggingFaceBackend) StreamChat(ctx context.Context, req *harness.ChatRequest) (<-chan string, error) {
+	prompt := messagesAsPrompt(req.Messages)
+	return hb.StreamTokens(ctx, &harness.CompletionRequest{
+		Prompt:      prompt,
+		Temperature: req.Temperature,
+		MaxTokens:   req.MaxTokens,
+		Model:       req.Model,
+	})
+}
+
+// messagesAsPrompt formats a chat history into a plain-text prompt for backends
+// that don't natively support the chat messages format.
+func messagesAsPrompt(messages []harness.ChatMessage) string {
+	var sb strings.Builder
+	for _, m := range messages {
+		switch m.Role {
+		case "system":
+			sb.WriteString("System: ")
+		case "user":
+			sb.WriteString("User: ")
+		case "assistant":
+			sb.WriteString("Assistant: ")
+		}
+		sb.WriteString(m.Content)
+		sb.WriteString("\n")
+	}
+	sb.WriteString("Assistant:")
+	return sb.String()
+}
+
 // ListModels implements harness.LLMProvider
 func (hb *HuggingFaceBackend) ListModels(ctx context.Context) ([]harness.ModelInfo, error) {
 	return []harness.ModelInfo{

@@ -6,11 +6,17 @@ import (
 
 // LLMProvider is the interface that all model backends must implement
 type LLMProvider interface {
-	// Complete sends a completion request and returns a response
+	// Complete sends a single-turn completion request and returns a response
 	Complete(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error)
 
 	// StreamTokens returns a channel that streams response tokens one by one
 	StreamTokens(ctx context.Context, req *CompletionRequest) (<-chan string, error)
+
+	// Chat sends a multi-turn chat request and returns the assistant's response
+	Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error)
+
+	// StreamChat sends a multi-turn chat request and streams the response tokens
+	StreamChat(ctx context.Context, req *ChatRequest) (<-chan string, error)
 
 	// ListModels returns a list of available models for this provider
 	ListModels(ctx context.Context) ([]ModelInfo, error)
@@ -72,6 +78,26 @@ func (h *Harness) StreamTokens(ctx context.Context, req *CompletionRequest) (<-c
 	}
 
 	return provider.StreamTokens(ctx, req)
+}
+
+// Chat sends a multi-turn chat request to the appropriate backend
+func (h *Harness) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
+	provider, err := h.router.Route(req.Model)
+	if err != nil {
+		return nil, err
+	}
+
+	return provider.Chat(ctx, req)
+}
+
+// StreamChat streams a multi-turn chat response from the appropriate backend
+func (h *Harness) StreamChat(ctx context.Context, req *ChatRequest) (<-chan string, error) {
+	provider, err := h.router.Route(req.Model)
+	if err != nil {
+		return nil, err
+	}
+
+	return provider.StreamChat(ctx, req)
 }
 
 // ListAllModels returns all available models from all providers

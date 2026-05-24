@@ -126,9 +126,13 @@ func main() {
 					log.Fatalf("model_path must be specified for embedded llamacpp backend %q", name)
 				}
 
+				gpuLayers := bcfg.GPULayers
+				if gpuLayers == 0 {
+					gpuLayers = *llamaGPU
+				}
 				log.Printf("Starting embedded llama-server for %q on port %d...", name, port)
 				modelPath := os.ExpandEnv(bcfg.ModelPath)
-				_, err := toolMgr.StartLlamaServer(modelPath, port, *llamaGPU)
+				_, err := toolMgr.StartLlamaServer(modelPath, port, gpuLayers, bcfg.ChatTemplate)
 				if err != nil {
 					log.Fatalf("Failed to start llama-server for %q: %v", name, err)
 				}
@@ -180,6 +184,7 @@ func main() {
 	// Register handlers
 	handler := NewHandler(h)
 	r.Post("/v1/completions", handler.HandleCompletion)
+	r.Post("/v1/chat/completions", handler.HandleChat)
 	r.Get("/v1/models", handler.HandleListModels)
 	r.Get("/health", handler.HandleHealth)
 

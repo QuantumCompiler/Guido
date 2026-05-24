@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,7 +18,7 @@ type Manager struct {
 	launched map[string]*ManagedProcess
 }
 
-// ManagedProcess represents a running tool process
+// ManagedProcess represents a running tool process/
 type ManagedProcess struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
@@ -55,23 +56,27 @@ func (m *Manager) GetToolPath(toolName string) (string, error) {
 	return path, nil
 }
 
-// StartLlamaServer starts llama-server with the given model and returns the port
-func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int) (int, error) {
+// StartLlamaServer starts llama-server with the given model and waits until it
+// is actually accepting connections (or times out). chatTemplate is optional.
+func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, chatTemplate string) (int, error) {
 	toolPath, err := m.GetToolPath("llama-server")
 	if err != nil {
 		return 0, err
 	}
 
-	// Build command
 	args := []string{
 		"-m", modelPath,
 		"--port", fmt.Sprintf("%d", port),
 		"--gpu-layers", fmt.Sprintf("%d", nGPULayers),
 	}
+	if chatTemplate != "" {
+		args = append(args, "--chat-template", chatTemplate)
+	}
+
+	// Log the exact command so it's visible in the terminal for debugging.
+	fmt.Printf("[guido] starting llama-server: %s %v\n", toolPath, args)
 
 	cmd := exec.Command(toolPath, args...)
-
-	// Capture output for debugging
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -79,17 +84,46 @@ func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int) (
 		return 0, fmt.Errorf("failed to start llama-server: %w", err)
 	}
 
-	// Wait for server to be ready and check if process is still running
-	for i := 0; i < 5; i++ {
-		time.Sleep(500 * time.Millisecond)
+	// Watch for early exit in a goroutine. cmd.ProcessState is only populated
+	// after cmd.Wait() returns, so we must call Wait() to detect crashes.
+	exitErr := make(chan error, 1)
+	go func() {
+		exitErr <- cmd.Wait()
+	}()
 
-		// Check if process exited
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-			return 0, fmt.Errorf("llama-server exited immediately (port may be in use)")
+	// Poll until the server is accepting HTTP connections (200 or 503 = loading).
+	// Give up after 30 seconds — if it hasn't bound the port by then, something
+	// is wrong (bad flag, immediate crash, etc.).
+	healthURL := fmt.Sprintf("http://localhost:%d/health", port)
+	client := &http.Client{Timeout: 1 * time.Second}
+	deadline := time.Now().Add(30 * time.Second)
+
+	for time.Now().Before(deadline) {
+		// Did the process exit already?
+		select {
+		case err := <-exitErr:
+			if err != nil {
+				return 0, fmt.Errorf("llama-server exited during startup: %w", err)
+			}
+			return 0, fmt.Errorf("llama-server exited during startup (no error)")
+		default:
 		}
+
+		// Is it listening yet?
+		resp, err := client.Get(healthURL)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusServiceUnavailable {
+				// 200 = ready, 503 = model still loading but server is up
+				fmt.Printf("[guido] llama-server is listening on port %d (model may still be loading)\n", port)
+				// Put the exit watcher back so the process still gets reaped.
+				go func() { <-exitErr }()
+				break
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Final verification
 	if cmd.Process == nil {
 		return 0, errors.New("llama-server process not running")
 	}
@@ -135,7 +169,6 @@ func (m *Manager) Close() error {
 
 	return nil
 }
-
 
 // ToolsDir returns the directory where tools are extracted
 func (m *Manager) ToolsDir() string {
