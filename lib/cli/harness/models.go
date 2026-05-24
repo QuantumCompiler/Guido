@@ -45,9 +45,11 @@ type ModelsConfig struct {
 
 // BackendConfig represents configuration for a specific backend
 type BackendConfig struct {
-	APIKey string `yaml:"api_key" json:"api_key"`
-	URL    string `yaml:"url" json:"url"`
-	Model  string `yaml:"model" json:"model"`
-	// Additional backend-specific fields can be added here
-	Extra map[string]interface{} `yaml:",inline" json:",inline"`
+	Type      string                 `yaml:"type" json:"type"`             // "llamacpp", "openai", "anthropic", "mock", "huggingface"
+	APIKey    string                 `yaml:"api_key" json:"api_key"`
+	URL       string                 `yaml:"url" json:"url"`
+	Model     string                 `yaml:"model" json:"model"`
+	ModelPath string                 `yaml:"model_path" json:"model_path"` // Path to local model file for embedded servers
+	Port      int                    `yaml:"port" json:"port"`             // Port for embedded servers (default auto-assigned)
+	Extra     map[string]interface{} `yaml:"-" json:"-"`                   // Unused, kept for future use
 }

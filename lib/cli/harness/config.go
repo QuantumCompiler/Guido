@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/viper"
 )
 
@@ -34,8 +35,31 @@ func LoadConfig(configPath string) (*Config, error) {
 	v.AutomaticEnv()
 
 	var cfg Config
-	if err := v.Unmarshal(&cfg); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+
+	// Use custom decoder to properly handle nested structs with YAML tags
+	decoderConfig := &mapstructure.DecoderConfig{
+		DecodeHook: mapstructure.StringToSliceHookFunc(","),
+		Result:     &cfg,
+		TagName:    "yaml",
+	}
+	decoder, err := mapstructure.NewDecoder(decoderConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create decoder: %w", err)
+	}
+
+	// Get the raw config as a map first
+	rawCfg := v.AllSettings()
+	if err := decoder.Decode(rawCfg); err != nil {
+		return nil, fmt.Errorf("failed to decode config: %w", err)
+	}
+
+	// Expand environment variables in backend configurations
+	for name, bcfg := range cfg.Backends {
+		bcfg.APIKey = os.ExpandEnv(bcfg.APIKey)
+		bcfg.URL = os.ExpandEnv(bcfg.URL)
+		bcfg.Model = os.ExpandEnv(bcfg.Model)
+		bcfg.ModelPath = os.ExpandEnv(bcfg.ModelPath)
+		cfg.Backends[name] = bcfg
 	}
 
 	if err := validateConfig(&cfg); err != nil {
@@ -65,8 +89,22 @@ func LoadConfigFromEnv() (*Config, error) {
 	v.AutomaticEnv()
 
 	var cfg Config
-	if err := v.Unmarshal(&cfg); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+
+	// Use custom decoder to properly handle nested structs with YAML tags
+	decoderConfig := &mapstructure.DecoderConfig{
+		DecodeHook: mapstructure.StringToSliceHookFunc(","),
+		Result:     &cfg,
+		TagName:    "yaml",
+	}
+	decoder, err := mapstructure.NewDecoder(decoderConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create decoder: %w", err)
+	}
+
+	// Get the raw config as a map first
+	rawCfg := v.AllSettings()
+	if err := decoder.Decode(rawCfg); err != nil {
+		return nil, fmt.Errorf("failed to decode config: %w", err)
 	}
 
 	if err := validateConfig(&cfg); err != nil {

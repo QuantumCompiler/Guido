@@ -4,12 +4,16 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"guido/lib/cli/backends"
 	"guido/lib/cli/harness"
+	"guido/lib/cli/tools"
 )
 
 var (
@@ -17,12 +21,40 @@ var (
 	model      string
 	temperature float32
 	maxTokens   int
+	toolMgr    *tools.Manager
 )
 
 var rootCmd = &cobra.Command{
 	Use:   "guido",
 	Short: "Guido - LLM Model Harness",
 	Long:  `Guido is a unified interface for interacting with local and cloud LLM models.`,
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		// Initialize tool manager once for all commands
+		toolsDir := os.Getenv("GUIDO_TOOLS_DIR")
+		if toolsDir == "" {
+			// Try relative to current directory
+			toolsDir = "bin/llama-cpp-tools"
+			if _, err := os.Stat(toolsDir); os.IsNotExist(err) {
+				// Try relative to executable
+				exePath, err := os.Executable()
+				if err == nil {
+					toolsDir = filepath.Join(filepath.Dir(exePath), "llama-cpp-tools")
+				}
+			}
+		}
+
+		var err error
+		toolMgr, err = tools.NewManagerFromDir(toolsDir)
+		if err != nil {
+			log.Fatalf("Failed to initialize tools: %v", err)
+		}
+	},
+	PersistentPostRun: func(cmd *cobra.Command, args []string) {
+		// Note: We intentionally do NOT close the tool manager here,
+		// as the llama-server is a long-lived process that should persist
+		// across multiple CLI invocations for efficient reuse.
+		// The server will be cleaned up when the user exits their shell session.
+	},
 }
 
 var completeCmd = &cobra.Command{
@@ -41,8 +73,8 @@ var completeCmd = &cobra.Command{
 		// Initialize harness
 		h := harness.NewHarness(cfg)
 
-		// Register backends
-		providers := initializeBackends(h, cfg)
+		// Register backends (pass tool manager for embedded llama-server support)
+		providers := initializeBackends(h, cfg, toolMgr)
 
 		if len(providers) == 0 {
 			log.Fatal("No backends configured")
@@ -90,7 +122,7 @@ var chatCmd = &cobra.Command{
 		h := harness.NewHarness(cfg)
 
 		// Register backends
-		providers := initializeBackends(h, cfg)
+		providers := initializeBackends(h, cfg, toolMgr)
 
 		if len(providers) == 0 {
 			log.Fatal("No backends configured")
@@ -121,7 +153,7 @@ var modelsCmd = &cobra.Command{
 		h := harness.NewHarness(cfg)
 
 		// Register backends
-		providers := initializeBackends(h, cfg)
+		providers := initializeBackends(h, cfg, toolMgr)
 
 		if len(providers) == 0 {
 			fmt.Println("No backends configured")
@@ -145,48 +177,132 @@ var modelsCmd = &cobra.Command{
 	},
 }
 
-func initializeBackends(h *harness.Harness, cfg *harness.Config) map[string]harness.LLMProvider {
+// backendType resolves the effective backend type for a named config entry.
+// Explicit "type" field wins; otherwise the key name is used for backward compatibility
+// (e.g. a key named "openai" is treated as type "openai").
+func backendType(key string, cfg harness.BackendConfig) string {
+	if cfg.Type != "" {
+		return cfg.Type
+	}
+	// Backward-compat: key name IS the type for the original single-backend style
+	switch key {
+	case "openai", "anthropic", "llamacpp", "mock", "huggingface":
+		return key
+	}
+	return ""
+}
+
+// nextEmbeddedPort finds the next available port starting from basePort.
+func nextEmbeddedPort(used map[int]bool, basePort int) int {
+	p := basePort
+	for used[p] {
+		p++
+	}
+	return p
+}
+
+func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manager) map[string]harness.LLMProvider {
 	providers := make(map[string]harness.LLMProvider)
+	usedPorts := make(map[int]bool)
 
-	if openaiCfg, ok := cfg.Backends["openai"]; ok && openaiCfg.APIKey != "" {
-		modelName := openaiCfg.Model
-		if modelName == "" {
-			modelName = "gpt-4"
+	for name, bcfg := range cfg.Backends {
+		typ := backendType(name, bcfg)
+
+		switch typ {
+		case "openai":
+			if bcfg.APIKey == "" {
+				continue
+			}
+			modelName := bcfg.Model
+			if modelName == "" {
+				modelName = "gpt-4"
+			}
+			providers[name] = backends.NewOpenAIBackend(bcfg.APIKey, modelName)
+			h.RegisterProvider(name, providers[name])
+
+		case "anthropic":
+			if bcfg.APIKey == "" {
+				continue
+			}
+			modelName := bcfg.Model
+			if modelName == "" {
+				modelName = "claude-3-sonnet"
+			}
+			providers[name] = backends.NewAnthropicBackend(bcfg.APIKey, modelName)
+			h.RegisterProvider(name, providers[name])
+
+		case "llamacpp":
+			if bcfg.URL == "" && bcfg.ModelPath == "" {
+				continue
+			}
+			modelName := bcfg.Model
+			if modelName == "" {
+				modelName = "llama"
+			}
+
+			llamacppURL := bcfg.URL
+			if bcfg.URL == "embedded" || bcfg.URL == "" {
+				// Determine which port this instance should use.
+				// Config can specify an explicit port; otherwise auto-assign from 8000 up.
+				port := bcfg.Port
+				if port == 0 {
+					port = nextEmbeddedPort(usedPorts, 8000)
+				}
+				usedPorts[port] = true
+				llamacppURL = fmt.Sprintf("http://localhost:%d", port)
+
+				// Check if a server is already running on this port.
+				serverRunning := false
+				for i := 0; i < 3; i++ {
+					resp, err := http.Get(llamacppURL + "/health")
+					if err == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusServiceUnavailable) {
+						serverRunning = true
+						resp.Body.Close()
+						break
+					}
+					if resp != nil {
+						resp.Body.Close()
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+
+				if !serverRunning {
+					if tm != nil && bcfg.ModelPath != "" {
+						log.Printf("Starting embedded llama-server for %q on port %d...", name, port)
+						expandedModelPath := os.ExpandEnv(bcfg.ModelPath)
+						_, err := tm.StartLlamaServer(expandedModelPath, port, 99)
+						if err != nil {
+							log.Fatalf("Failed to start embedded llama-server for %q: %v\n", name, err)
+						}
+						log.Printf("Embedded llama-server for %q ready at %s", name, llamacppURL)
+					}
+				} else {
+					log.Printf("Using existing llama-server for %q at %s", name, llamacppURL)
+				}
+			}
+
+			providers[name] = backends.NewLlamaCppBackend(llamacppURL, modelName)
+			h.RegisterProvider(name, providers[name])
+
+		case "mock":
+			modelName := bcfg.Model
+			if modelName == "" {
+				modelName = "test-model"
+			}
+			providers[name] = backends.NewMockBackend(modelName)
+			h.RegisterProvider(name, providers[name])
+
+		case "huggingface":
+			if bcfg.Model == "" {
+				continue
+			}
+			var cacheDir string
+			if extra, ok := bcfg.Extra["cache_dir"].(string); ok {
+				cacheDir = extra
+			}
+			providers[name] = backends.NewHuggingFaceBackend(bcfg.Model, cacheDir)
+			h.RegisterProvider(name, providers[name])
 		}
-		providers["openai"] = backends.NewOpenAIBackend(openaiCfg.APIKey, modelName)
-		h.RegisterProvider("openai", providers["openai"])
-	}
-
-	if anthropicCfg, ok := cfg.Backends["anthropic"]; ok && anthropicCfg.APIKey != "" {
-		modelName := anthropicCfg.Model
-		if modelName == "" {
-			modelName = "claude-3-sonnet"
-		}
-		providers["anthropic"] = backends.NewAnthropicBackend(anthropicCfg.APIKey, modelName)
-		h.RegisterProvider("anthropic", providers["anthropic"])
-	}
-
-	if llamacppCfg, ok := cfg.Backends["llamacpp"]; ok && llamacppCfg.URL != "" {
-		modelName := llamacppCfg.Model
-		if modelName == "" {
-			modelName = "llama"
-		}
-		providers["llamacpp"] = backends.NewLlamaCppBackend(llamacppCfg.URL, modelName)
-		h.RegisterProvider("llamacpp", providers["llamacpp"])
-	}
-
-	if _, ok := cfg.Backends["mock"]; ok {
-		providers["mock"] = backends.NewMockBackend("test-model")
-		h.RegisterProvider("mock", providers["mock"])
-	}
-
-	if hfCfg, ok := cfg.Backends["huggingface"]; ok && hfCfg.Model != "" {
-		var cacheDir string
-		if extra, ok := hfCfg.Extra["cache_dir"].(string); ok {
-			cacheDir = extra
-		}
-		providers["huggingface"] = backends.NewHuggingFaceBackend(hfCfg.Model, cacheDir)
-		h.RegisterProvider("huggingface", providers["huggingface"])
 	}
 
 	return providers
@@ -196,7 +312,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "config.yaml", "Path to config file")
 	completeCmd.Flags().StringVarP(&model, "model", "m", "", "Model to use (default from config)")
 	completeCmd.Flags().Float32VarP(&temperature, "temperature", "t", 0.7, "Temperature for sampling")
-	completeCmd.Flags().IntVarP(&maxTokens, "max-tokens", "n", 256, "Maximum tokens to generate")
+	completeCmd.Flags().IntVarP(&maxTokens, "max-tokens", "n", -1, "Maximum tokens to generate (-1 for unlimited)")
 
 	rootCmd.AddCommand(completeCmd)
 	rootCmd.AddCommand(chatCmd)

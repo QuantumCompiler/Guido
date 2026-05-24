@@ -2,6 +2,58 @@
 
 A unified Go-based abstraction layer for interacting with both local and cloud LLM models. Guido provides a consistent interface for seamlessly switching between different model providers.
 
+## ⚡ Quick Start (TLDR)
+
+### Build
+```bash
+cd lib/cli
+make build
+```
+
+This builds both `guido-harness` (HTTP server) and `guido-cli` (command-line tool) with embedded llama.cpp tools.
+
+### Configure
+Copy or edit `config.yaml`:
+```yaml
+backends:
+  llamacpp:
+    url: "embedded"  # Auto-starts embedded llama-server
+    model: "gpt-oss:120b"
+    model_path: "${HOME}/.cache/huggingface/hub/models--openai--gpt-oss-120b/gguf/model.gguf"
+  mock:
+    model: "test-model"  # For testing without models
+```
+
+### Run HTTP Server
+```bash
+./bin/guido-harness -config config.yaml
+```
+
+Then make requests:
+```bash
+# Health check
+curl http://localhost:8080/health
+
+# List models
+curl http://localhost:8080/v1/models
+
+# Get completion
+curl -X POST http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Hello","model":"mock","max_tokens":50}'
+```
+
+### Run CLI
+```bash
+# List models
+./bin/guido-cli -c config.yaml models
+
+# Get completion
+./bin/guido-cli -c config.yaml complete "What is AI?" -m mock
+```
+
+---
+
 ## Features
 
 - **Multi-backend support**: Local models (via llama.cpp), OpenAI, and Anthropic APIs
@@ -16,27 +68,43 @@ A unified Go-based abstraction layer for interacting with both local and cloud L
 lib/cli/
 ├── harness/              # Core abstraction layer
 │   ├── llm.go           # LLMProvider interface & routing logic
-│   ├── config.go        # Configuration loading
+│   ├── config.go        # Configuration loading & env expansion
 │   ├── models.go        # Type definitions
 │   └── errors.go        # Error types
 │
 ├── backends/            # Provider implementations
 │   ├── llamacpp.go      # llama.cpp HTTP adapter
 │   ├── openai.go        # OpenAI API adapter
-│   └── anthropic.go     # Anthropic API adapter
+│   ├── anthropic.go     # Anthropic API adapter
+│   ├── mock.go          # Mock backend for testing
+│   └── huggingface.go   # HuggingFace transformers adapter
+│
+├── tools/               # Tool management
+│   └── manager.go       # Lifecycle management for llama-server
 │
 ├── cmd/
-│   ├── server/          # HTTP server entry point
+│   ├── harness/         # HTTP server entry point
 │   │   ├── main.go
 │   │   └── handler.go   # HTTP request handlers
 │   │
 │   └── cli/             # CLI entry point
 │       └── main.go
 │
-├── bin/                 # Compiled binaries
-│   ├── guido-server
-│   └── guido-cli
+├── scripts/             # Build scripts
+│   ├── build-llama.sh   # Compile llama.cpp from submodule
+│   └── create-py-wrappers.sh  # Create Python wrapper executables
 │
+├── bin/                 # Compiled binaries & embedded tools
+│   ├── guido-harness    # HTTP server with embedded llama-server
+│   ├── guido-cli        # CLI tool
+│   └── llama-cpp-tools/ # Embedded llama.cpp tools
+│       ├── llama-server
+│       ├── llama-cli
+│       ├── llama-quantize
+│       ├── llama-bench
+│       └── ... (other tools)
+│
+├── Makefile             # Build orchestration
 ├── config.yaml          # Sample configuration
 ├── go.mod               # Go module definition
 └── go.sum               # Dependency checksums
@@ -48,9 +116,10 @@ lib/cli/
 
 ```bash
 cd lib/cli
-go build -o bin/guido-server ./cmd/server
-go build -o bin/guido-cli ./cmd/cli
+make build
 ```
+
+This compiles llama.cpp tools and builds both the HTTP server and CLI with embedded tools. Binaries are placed in `bin/guido-{harness,cli}`.
 
 ## Configuration
 
@@ -86,13 +155,13 @@ backends:
 
 ## Usage
 
-### Server Mode
+### Server Mode (HTTP API)
 
 Start the HTTP server:
 
 ```bash
 cd lib/cli
-./bin/guido-server -config config.yaml
+./bin/guido-harness -config config.yaml
 ```
 
 The server exposes these endpoints:
@@ -155,24 +224,36 @@ Interactive chat (placeholder):
 
 ## Setting up Local Models with llama.cpp
 
-1. Install llama.cpp:
-```bash
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp
-make
-```
+llama.cpp tools are embedded in the Guido binary. No separate installation needed!
 
-2. Start the HTTP server:
-```bash
-./llama-server -m model.gguf -c 2048
-```
+**Option 1: Embedded llama-server (Recommended)**
 
-3. Update your config to use llamacpp backend:
+Set `url: "embedded"` in your config:
 ```yaml
 backends:
   llamacpp:
-    url: "http://localhost:8000"
-    model: "llama-2"
+    url: "embedded"              # Auto-starts on harness startup
+    model: "gpt-oss:120b"
+    model_path: "/path/to/model.gguf"
+```
+
+The harness will automatically start llama-server with your model. Environment variables like `${HOME}` are expanded.
+
+**Option 2: External llama-server**
+
+If you prefer to manage the server separately:
+```bash
+# Point to external server
+# From a different terminal:
+./lib/cli/bin/llama-cpp-tools/llama-server -m /path/to/model.gguf --port 8001
+```
+
+Then in config:
+```yaml
+backends:
+  llamacpp:
+    url: "http://localhost:8001"
+    model: "gpt-oss:120b"
 ```
 
 ## Using as a Library
@@ -299,7 +380,7 @@ type CompletionResponse struct {
 Start the server:
 ```bash
 cd lib/cli
-./bin/guido-server -config config.yaml
+./bin/guido-harness -config config.yaml
 ```
 
 In another terminal:

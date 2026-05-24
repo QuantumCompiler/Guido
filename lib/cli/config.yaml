@@ -3,24 +3,78 @@ server:
   mode: http              # 'http' for service, 'cli' for command-line
 
 models:
-  default: openai         # Default model to use if not specified
+  default: llamacpp       # Default provider name to use if not specified in request
 
 backends:
-  openai:
-    api_key: "${OPENAI_API_KEY}"
-    model: "gpt-4"
+  # ─────────────────────────────────────────────────────────────────────
+  # LOCAL MODELS (llama.cpp embedded server)
+  #
+  # Each entry is a named provider you reference with -m <name>.
+  # Set "type: llamacpp" when you need more than one local model.
+  # The key name alone is enough for a single backend (backward compat).
+  # ─────────────────────────────────────────────────────────────────────
 
-  anthropic:
-    api_key: "${ANTHROPIC_API_KEY}"
-    model: "claude-3-sonnet-20240229"
+  # Single local model — classic style, key name = type
+  gemma4:
+    type: llamacpp
+    url: "embedded"
+    port: 8002
+    model: "gemma4:31b"
+    model_path: "${HOME}/.cache/huggingface/hub/models--google--gemma-4-31B/gguf/model-f16.gguf"
 
-  llamacpp:
-    url: "http://localhost:8080"
-    model: "llama-2"
+  # Multiple local models — use explicit "type: llamacpp" + unique key names
+  # Each gets its own llama-server on a separate port (auto-assigned or explicit).
+  #
+  # gemma-small:
+  #   type: llamacpp
+  #   url: "embedded"
+  #   port: 8001                           # optional: pin to a specific port
+  #   model: "gemma-4-31b"
+  #   model_path: "${HOME}/.cache/huggingface/hub/models--google--gemma-4-31B/gguf/model-f16.gguf"
+  #
+  # mistral-fast:
+  #   type: llamacpp
+  #   url: "embedded"
+  #   port: 8002
+  #   model: "mistral-7b"
+  #   model_path: "${HOME}/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.1/gguf/model-q4_k_m.gguf"
+  #
+  # Point to an already-running llama-server (no embedded spawn):
+  # external-llm:
+  #   type: llamacpp
+  #   url: "http://192.168.1.50:8000"
+  #   model: "my-remote-model"
 
-  huggingface:
-    model: "${HUGGINGFACE_MODEL}"
-    cache_dir: "${HUGGINGFACE_CACHE}"
+  # ─────────────────────────────────────────────────────────────────────
+  # CLOUD APIs
+  # ─────────────────────────────────────────────────────────────────────
+
+  # openai:
+  #   api_key: "${OPENAI_API_KEY}"
+  #   model: "gpt-4"
+
+  # anthropic:
+  #   api_key: "${ANTHROPIC_API_KEY}"
+  #   model: "claude-3-sonnet-20240229"
+
+  # Multiple OpenAI-style providers (e.g. Azure endpoint alongside OpenAI):
+  # openai-azure:
+  #   type: openai
+  #   api_key: "${AZURE_OPENAI_KEY}"
+  #   url: "https://my-resource.openai.azure.com/..."
+  #   model: "gpt-4"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # TESTING
+  # ─────────────────────────────────────────────────────────────────────
 
   mock:
     model: "test-model"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # HUGGINGFACE (local Python inference — slow, for experimentation)
+  # ─────────────────────────────────────────────────────────────────────
+
+  # huggingface:
+  #   model: "${HUGGINGFACE_MODEL}"
+  #   cache_dir: "${HUGGINGFACE_CACHE}"

@@ -31,8 +31,9 @@ type ModelRouter interface {
 
 // SimpleRouter implements ModelRouter with basic model->backend mapping
 type SimpleRouter struct {
-	backends map[string]LLMProvider
-	config   *Config
+	backends   map[string]LLMProvider
+	config     *Config
+	modelIndex map[string]LLMProvider // model name / backend key → provider
 }
 
 // NewHarness creates a new harness instance
@@ -89,21 +90,25 @@ func (h *Harness) ListAllModels(ctx context.Context) ([]ModelInfo, error) {
 	return allModels, nil
 }
 
-// Route implements ModelRouter by mapping model names to backends
+// Route implements ModelRouter by mapping model names to backends.
+// It matches by backend key name first, then by the model name configured
+// in the backend (e.g. "gemma4:31b" → the "gemma4" provider).
 func (sr *SimpleRouter) Route(modelName string) (LLMProvider, error) {
-	// If the model name doesn't exist, use the default
 	if modelName == "" {
 		modelName = sr.config.Models.Default
 	}
 
-	// Look for a backend that claims to handle this model
-	for backendName, provider := range sr.backends {
-		if backendName == modelName || sr.canHandle(backendName, modelName) {
-			return provider, nil
-		}
+	// Direct lookup in index (backend key OR configured model name)
+	if provider, ok := sr.modelIndex[modelName]; ok {
+		return provider, nil
 	}
 
-	// Default to the first available backend
+	// Fall back to the default provider
+	if defaultProvider, ok := sr.modelIndex[sr.config.Models.Default]; ok {
+		return defaultProvider, nil
+	}
+
+	// Last resort: any registered provider
 	for _, provider := range sr.backends {
 		return provider, nil
 	}
@@ -111,17 +116,27 @@ func (sr *SimpleRouter) Route(modelName string) (LLMProvider, error) {
 	return nil, ErrNoAvailableBackend
 }
 
-// canHandle checks if a backend can handle a specific model
-func (sr *SimpleRouter) canHandle(backendName, modelName string) bool {
-	// For now, we assume backend names map to model names
-	// This can be extended to support model groups or aliases
-	return false
-}
-
-// NewSimpleRouter creates a new SimpleRouter
+// NewSimpleRouter creates a new SimpleRouter and pre-builds the model index
+// so that both backend key names and configured model names resolve correctly.
 func NewSimpleRouter(cfg *Config, backends map[string]LLMProvider) *SimpleRouter {
-	return &SimpleRouter{
-		backends: backends,
-		config:   cfg,
+	sr := &SimpleRouter{
+		backends:   backends,
+		config:     cfg,
+		modelIndex: make(map[string]LLMProvider),
 	}
+
+	for backendName, bcfg := range cfg.Backends {
+		provider, ok := backends[backendName]
+		if !ok {
+			continue
+		}
+		// Register by backend key (e.g. "gemma4")
+		sr.modelIndex[backendName] = provider
+		// Register by the model name from config (e.g. "gemma4:31b")
+		if bcfg.Model != "" {
+			sr.modelIndex[bcfg.Model] = provider
+		}
+	}
+
+	return sr
 }

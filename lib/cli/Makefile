@@ -58,8 +58,8 @@ build-llama:
 build-go:
 	@echo "Building Go binaries..."
 	@mkdir -p bin
-	@go build -o bin/guido-harness ./cmd/harness
-	@go build -o bin/guido-cli ./cmd/cli
+	@cd . && go build -o bin/guido-harness ./cmd/harness
+	@cd . && go build -o bin/guido-cli ./cmd/cli
 	@echo "✓ Go binaries built: bin/guido-{harness,cli}"
 
 # Install binaries (just reports where they are)
