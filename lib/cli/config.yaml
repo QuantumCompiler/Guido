@@ -15,5 +15,12 @@ backends:
     model: "claude-3-sonnet-20240229"
 
   llamacpp:
-    url: "http://localhost:8000"
+    url: "http://localhost:8080"
     model: "llama-2"
+
+  huggingface:
+    model: "${HUGGINGFACE_MODEL}"
+    cache_dir: "${HUGGINGFACE_CACHE}"
+
+  mock:
+    model: "test-model"

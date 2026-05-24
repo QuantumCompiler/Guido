@@ -27,6 +27,8 @@ func LoadConfig(configPath string) (*Config, error) {
 	v.BindEnv("backends.openai.api_key", "OPENAI_API_KEY")
 	v.BindEnv("backends.anthropic.api_key", "ANTHROPIC_API_KEY")
 	v.BindEnv("backends.llamacpp.url", "LLAMACPP_URL")
+	v.BindEnv("backends.huggingface.model", "HUGGINGFACE_MODEL")
+	v.BindEnv("backends.huggingface.cache_dir", "HUGGINGFACE_CACHE")
 
 	// Allow env var overrides
 	v.AutomaticEnv()
@@ -56,6 +58,8 @@ func LoadConfigFromEnv() (*Config, error) {
 	v.BindEnv("backends.openai.api_key", "OPENAI_API_KEY")
 	v.BindEnv("backends.anthropic.api_key", "ANTHROPIC_API_KEY")
 	v.BindEnv("backends.llamacpp.url", "LLAMACPP_URL")
+	v.BindEnv("backends.huggingface.model", "HUGGINGFACE_MODEL")
+	v.BindEnv("backends.huggingface.cache_dir", "HUGGINGFACE_CACHE")
 
 	// Allow env var overrides
 	v.AutomaticEnv()

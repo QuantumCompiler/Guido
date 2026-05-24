@@ -65,8 +65,7 @@ var completeCmd = &cobra.Command{
 		}
 
 		// Get completion
-		ctx, cancel := context.WithTimeout(context.Background(), 0) // No timeout
-		defer cancel()
+		ctx := context.Background()
 
 		resp, err := h.Complete(ctx, req)
 		if err != nil {
@@ -133,9 +132,7 @@ var modelsCmd = &cobra.Command{
 		h.SetRouter(router)
 
 		// List models
-		ctx, cancel := context.WithTimeout(context.Background(), 0)
-		defer cancel()
-
+		ctx := context.Background()
 		models, err := h.ListAllModels(ctx)
 		if err != nil {
 			log.Fatalf("Failed to list models: %v", err)
@@ -176,6 +173,20 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config) map[string]harn
 		}
 		providers["llamacpp"] = backends.NewLlamaCppBackend(llamacppCfg.URL, modelName)
 		h.RegisterProvider("llamacpp", providers["llamacpp"])
+	}
+
+	if _, ok := cfg.Backends["mock"]; ok {
+		providers["mock"] = backends.NewMockBackend("test-model")
+		h.RegisterProvider("mock", providers["mock"])
+	}
+
+	if hfCfg, ok := cfg.Backends["huggingface"]; ok && hfCfg.Model != "" {
+		var cacheDir string
+		if extra, ok := hfCfg.Extra["cache_dir"].(string); ok {
+			cacheDir = extra
+		}
+		providers["huggingface"] = backends.NewHuggingFaceBackend(hfCfg.Model, cacheDir)
+		h.RegisterProvider("huggingface", providers["huggingface"])
 	}
 
 	return providers
