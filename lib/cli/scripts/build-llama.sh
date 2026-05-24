@@ -6,20 +6,21 @@ set -e
 
 # Get absolute paths - SAVE EARLY before any directory changes
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LLAMA_SRC_DIR="$SCRIPT_DIR/llama.cpp"
+BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+LLAMA_SRC_DIR="$BASE_DIR/llama.cpp"
 PY_WRAPPER_SCRIPT="$SCRIPT_DIR/create-py-wrappers.sh"
 
 # Build dir and output dir - convert to absolute paths
 if [[ "$1" = /* ]]; then
     LLAMA_BUILD_DIR="$1"
 else
-    LLAMA_BUILD_DIR="$SCRIPT_DIR/$1"
+    LLAMA_BUILD_DIR="$BASE_DIR/$1"
 fi
 
 if [[ "$2" = /* ]]; then
     OUTPUT_DIR="$2"
 else
-    OUTPUT_DIR="$SCRIPT_DIR/$2"
+    OUTPUT_DIR="$BASE_DIR/$2"
 fi
 
 echo "Building llama.cpp from: $LLAMA_SRC_DIR"

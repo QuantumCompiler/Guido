@@ -10,7 +10,7 @@
 
 # llama.cpp build
 lib/cli/llama.cpp/build/
-lib/cli/bin/llama-cpp-tools/
+lib/cli/bin
 
 # IDE
 .vscode/

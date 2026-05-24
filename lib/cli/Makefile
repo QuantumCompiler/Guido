@@ -51,7 +51,7 @@ build: build-llama build-go
 # Build llama.cpp tools
 build-llama:
 	@echo "Building llama.cpp tools for $(OS)-$(ARCH)..."
-	@./build-llama.sh "$(LLAMA_BUILD_DIR)" "$(LLAMA_TOOLS_DIR)"
+	@./scripts/build-llama.sh "$(LLAMA_BUILD_DIR)" "$(LLAMA_TOOLS_DIR)"
 	@echo "✓ llama.cpp tools built: $(LLAMA_TOOLS_DIR)/"
 
 # Build Go binaries
