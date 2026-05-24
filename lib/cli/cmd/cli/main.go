@@ -27,6 +27,7 @@ var (
 	temperature  float32
 	maxTokens    int
 	systemPrompt string
+	enableSearch bool // --search: give the model web_search + fetch_url tools
 	toolMgr      *tools.Manager
 )
 
@@ -160,6 +161,9 @@ var chatCmd = &cobra.Command{
 		if systemPrompt != "" {
 			fmt.Printf("System: %s\n", systemPrompt)
 		}
+		if enableSearch {
+			fmt.Println("Web search enabled (web_search + fetch_url)")
+		}
 		fmt.Println(strings.Repeat("─", 50))
 
 		scanner := bufio.NewScanner(os.Stdin)
@@ -180,43 +184,106 @@ var chatCmd = &cobra.Command{
 			// Add user message to history
 			history = append(history, harness.ChatMessage{Role: "user", Content: input})
 
-			req := &harness.ChatRequest{
-				Messages:    history,
-				Model:       chatModel,
-				Temperature: temperature,
-				MaxTokens:   maxTokens,
-				Stream:      true,
-			}
+			if enableSearch {
+				// ── Agentic tool-calling loop ──────────────────────────────
+				// Non-streaming so we can inspect tool_calls before printing.
+				// Loops until the model gives a final answer with no tool calls.
+				replied := false
+				for {
+					req := &harness.ChatRequest{
+						Messages:    history,
+						Model:       chatModel,
+						Temperature: temperature,
+						MaxTokens:   maxTokens,
+						Tools:       tools.WebTools(),
+					}
 
-			fmt.Print("\nAssistant: ")
+					resp, err := h.Chat(ctx, req)
+					if err != nil {
+						log.Printf("Error: %v", err)
+						history = history[:len(history)-1] // undo user message
+						break
+					}
 
-			// Stream the response token by token
-			tokenChan, err := h.StreamChat(ctx, req)
-			if err != nil {
-				log.Printf("Error: %v", err)
-				// Remove the failed user message from history
-				history = history[:len(history)-1]
-				continue
-			}
+					// Record the assistant turn (may contain tool_calls).
+					history = append(history, resp.Message)
 
-			var response strings.Builder
-			for token := range tokenChan {
-				// Strip any leaked end-of-turn tokens before printing
-				cleaned := stripStopTokens(token)
-				if cleaned != "" {
-					fmt.Print(cleaned)
-					response.WriteString(cleaned)
+					if len(resp.Message.ToolCalls) == 0 {
+						// Final answer — print and break.
+						text := strings.TrimSpace(stripStopTokens(resp.Message.Content))
+						fmt.Printf("\nAssistant: %s\n", text)
+						replied = true
+						break
+					}
+
+					// Execute each tool call the model requested.
+					for _, tc := range resp.Message.ToolCalls {
+						// Show the user what's happening.
+						var args map[string]interface{}
+						_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+						switch tc.Function.Name {
+						case "web_search":
+							q, _ := args["query"].(string)
+							fmt.Printf("\n[searching] %q...\n", q)
+						case "fetch_url":
+							u, _ := args["url"].(string)
+							fmt.Printf("\n[fetching] %s...\n", u)
+						default:
+							fmt.Printf("\n[tool] %s %v\n", tc.Function.Name, args)
+						}
+
+						result, execErr := tools.ExecuteTool(tc.Function.Name, tc.Function.Arguments)
+						if execErr != nil {
+							result = "Error: " + execErr.Error()
+						}
+
+						history = append(history, harness.ChatMessage{
+							Role:       "tool",
+							ToolCallID: tc.ID,
+							Content:    result,
+						})
+					}
+					// Loop — send tool results back to the model.
 				}
-			}
-			fmt.Println()
+				if !replied {
+					// Error path — already undone above, nothing to add.
+				}
+			} else {
+				// ── Normal streaming path (no tools) ──────────────────────
+				req := &harness.ChatRequest{
+					Messages:    history,
+					Model:       chatModel,
+					Temperature: temperature,
+					MaxTokens:   maxTokens,
+					Stream:      true,
+				}
 
-			// Add assistant response to history for next turn
-			assistantText := strings.TrimSpace(response.String())
-			if assistantText != "" {
-				history = append(history, harness.ChatMessage{
-					Role:    "assistant",
-					Content: assistantText,
-				})
+				fmt.Print("\nAssistant: ")
+
+				tokenChan, err := h.StreamChat(ctx, req)
+				if err != nil {
+					log.Printf("Error: %v", err)
+					history = history[:len(history)-1]
+					continue
+				}
+
+				var response strings.Builder
+				for token := range tokenChan {
+					cleaned := stripStopTokens(token)
+					if cleaned != "" {
+						fmt.Print(cleaned)
+						response.WriteString(cleaned)
+					}
+				}
+				fmt.Println()
+
+				assistantText := strings.TrimSpace(response.String())
+				if assistantText != "" {
+					history = append(history, harness.ChatMessage{
+						Role:    "assistant",
+						Content: assistantText,
+					})
+				}
 			}
 		}
 	},
@@ -400,7 +467,7 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "config.yaml", "Path to config file")
+	rootCmd.PersistentFlags().StringVar(&configPath, "config", "config.yaml", "Path to config file")
 
 	completeCmd.Flags().StringVarP(&model, "model", "m", "", "Model to use (default from config)")
 	completeCmd.Flags().Float32VarP(&temperature, "temperature", "t", 0.7, "Temperature for sampling")
@@ -410,6 +477,7 @@ func init() {
 	chatCmd.Flags().Float32VarP(&temperature, "temperature", "t", 0.7, "Temperature for sampling")
 	chatCmd.Flags().IntVarP(&maxTokens, "max-tokens", "n", -1, "Maximum tokens to generate (-1 for unlimited)")
 	chatCmd.Flags().StringVarP(&systemPrompt, "system", "s", "", "System prompt to set the assistant's behavior")
+	chatCmd.Flags().BoolVar(&enableSearch, "search", false, "Give the model web_search and fetch_url tools (internet access)")
 
 	rootCmd.AddCommand(completeCmd)
 	rootCmd.AddCommand(chatCmd)
@@ -527,6 +595,14 @@ func stripStopTokens(token string) string {
 }
 
 func main() {
+	// Normalize single-dash -config to --config so the CLI accepts the same
+	// flag style as the harness (which uses the standard flag package).
+	for i, arg := range os.Args[1:] {
+		if arg == "-config" {
+			os.Args[i+1] = "--config"
+		}
+	}
+
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)

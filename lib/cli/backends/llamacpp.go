@@ -170,7 +170,10 @@ type llamaCppChatRequest struct {
 	//   <end_of_turn>   Gemma native template
 	//   <|end|>         Phi-3
 	//   </s>            Legacy SentencePiece models
-	Stop []string `json:"stop,omitempty"`
+	// NOTE: omitted when Tools are present — the model's function-calling template
+	// manages its own stop tokens and explicit stops can interfere.
+	Stop  []string       `json:"stop,omitempty"`
+	Tools []harness.Tool `json:"tools,omitempty"`
 }
 
 // defaultStopSequences lists end-of-turn tokens that cover the most common chat
@@ -193,7 +196,13 @@ func (lcb *LlamaCppBackend) Chat(ctx context.Context, req *harness.ChatRequest) 
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
 		Stream:      false,
-		Stop:        defaultStopSequences,
+		Tools:       req.Tools,
+	}
+	// Only set explicit stop sequences when no tools are present.
+	// When tools are active the model's function-calling template manages its
+	// own stop tokens; injecting ours can cut the tool-call JSON short.
+	if len(req.Tools) == 0 {
+		chatReq.Stop = defaultStopSequences
 	}
 
 	body, err := json.Marshal(chatReq)
@@ -219,10 +228,15 @@ func (lcb *LlamaCppBackend) Chat(ctx context.Context, req *harness.ChatRequest) 
 		return nil, fmt.Errorf("llama.cpp returned status %d: %s", resp.StatusCode, b)
 	}
 
+	// Inline response type that captures tool_calls alongside the standard fields.
 	var result struct {
 		Choices []struct {
-			Message      harness.ChatMessage `json:"message"`
-			FinishReason string              `json:"finish_reason"`
+			Message struct {
+				Role      string             `json:"role"`
+				Content   string             `json:"content"`
+				ToolCalls []harness.ToolCall `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
 			CompletionTokens int `json:"completion_tokens"`
@@ -235,8 +249,13 @@ func (lcb *LlamaCppBackend) Chat(ctx context.Context, req *harness.ChatRequest) 
 		return nil, fmt.Errorf("llama.cpp returned no choices")
 	}
 
+	msg := harness.ChatMessage{
+		Role:      result.Choices[0].Message.Role,
+		Content:   result.Choices[0].Message.Content,
+		ToolCalls: result.Choices[0].Message.ToolCalls,
+	}
 	return &harness.ChatResponse{
-		Message:      result.Choices[0].Message,
+		Message:      msg,
 		FinishReason: result.Choices[0].FinishReason,
 		TokensUsed:   result.Usage.CompletionTokens,
 		Model:        lcb.model,

@@ -1,9 +1,45 @@
 package harness
 
-// ChatMessage represents a single message in a conversation
+import "encoding/json"
+
+// ─── Tool calling types (OpenAI function-calling compatible) ──────────────────
+
+// Tool describes a callable function that can be offered to the model.
+type Tool struct {
+	Type     string       `json:"type"`     // always "function"
+	Function ToolFunction `json:"function"`
+}
+
+// ToolFunction holds the name, description, and JSON-Schema parameters of a tool.
+type ToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"` // JSON Schema object
+}
+
+// ToolCall is a tool invocation requested by the model inside its response.
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"` // "function"
+	Function ToolCallFunction `json:"function"`
+}
+
+// ToolCallFunction carries the name and JSON-encoded arguments of one tool call.
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"` // JSON-encoded string, e.g. {"query":"..."}
+}
+
+// ─── Conversation message ─────────────────────────────────────────────────────
+
+// ChatMessage represents a single message in a conversation.
+// Role is one of: "system", "user", "assistant", "tool".
 type ChatMessage struct {
-	Role    string `json:"role"`    // "system", "user", or "assistant"
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // set when role=="assistant" with tool calls
+	ToolCallID string     `json:"tool_call_id,omitempty"` // set when role=="tool"
+	Name       string     `json:"name,omitempty"`         // tool name (optional, role=="tool")
 }
 
 // ChatRequest represents a multi-turn chat request
@@ -13,6 +49,7 @@ type ChatRequest struct {
 	Temperature float32       `json:"temperature"`
 	MaxTokens   int           `json:"max_tokens"`
 	Stream      bool          `json:"stream"`
+	Tools       []Tool        `json:"tools,omitempty"` // optional tool definitions
 }
 
 // ChatResponse represents the response from a chat request

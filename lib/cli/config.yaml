@@ -3,7 +3,7 @@ server:
   mode: http              # 'http' for service, 'cli' for command-line
 
 models:
-  default: gemma4       # Default provider name to use if not specified in request
+  default: gemma4-q4km       # Default provider name to use if not specified in request
 
 backends:
   # ─────────────────────────────────────────────────────────────────────
@@ -15,11 +15,11 @@ backends:
   # ─────────────────────────────────────────────────────────────────────
 
   # Single local model — classic style, key name = type
-  gemma4:
+  gemma4-q4km:
     type: llamacpp
     url: "embedded"
     port: 8002
-    model: "gemma4:31b"
+    model: "gemma4:31b-q4km"
     model_path: "${HOME}/.cache/huggingface/hub/models--google--gemma-4-31B/gguf/model-q4km.gguf"
 
   # Multiple local models — use explicit "type: llamacpp" + unique key names

@@ -68,6 +68,12 @@ func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, c
 		"-m", modelPath,
 		"--port", fmt.Sprintf("%d", port),
 		"--gpu-layers", fmt.Sprintf("%d", nGPULayers),
+		// Use the model's embedded Jinja template for chat formatting.
+		// This is required for proper function-calling / tool-use support
+		// (e.g. Gemma 4, Llama 3.1, Qwen 2.5).  Without --jinja the server
+		// falls back to a simplified built-in template that silently ignores
+		// the `tools` field in /v1/chat/completions requests.
+		"--jinja",
 	}
 	if chatTemplate != "" {
 		args = append(args, "--chat-template", chatTemplate)
