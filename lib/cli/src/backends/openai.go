@@ -13,28 +13,38 @@ import (
 	"guido/lib/cli/src/harness"
 )
 
-// OpenAIBackend implements harness.LLMProvider for OpenAI API via HTTP
+const defaultOpenAIBase = "https://api.openai.com"
+
+// OpenAIBackend implements harness.LLMProvider for OpenAI-compatible APIs.
+// Set baseURL to a custom endpoint (e.g. "http://localhost:11434") to talk to
+// Ollama or any other OpenAI-compatible server.
 type OpenAIBackend struct {
-	apiKey string
-	model  string
-	client *http.Client
+	apiKey  string
+	model   string
+	baseURL string
+	client  *http.Client
 }
 
-// openaiRequest is the request format for OpenAI API
+// ── Wire types ────────────────────────────────────────────────────────────────
+
 type openaiRequest struct {
 	Model       string           `json:"model"`
-	MaxTokens   int              `json:"max_tokens"`
-	Temperature float32          `json:"temperature"`
 	Messages    []openaiMessage  `json:"messages"`
+	Temperature float32          `json:"temperature"`
+	MaxTokens   int              `json:"max_tokens,omitempty"`
 	Stream      bool             `json:"stream"`
+	Tools       []harness.Tool   `json:"tools,omitempty"`       // nil → omitted (no tool mode)
+	ToolChoice  string           `json:"tool_choice,omitempty"` // "auto" when tools present
 }
 
+// openaiMessage is used for both request serialisation and response parsing.
 type openaiMessage struct {
-	Role    string                `json:"role"`
-	Content harness.MessageContent `json:"content"`
+	Role       string                 `json:"role"`
+	Content    harness.MessageContent `json:"content"`
+	ToolCalls  []harness.ToolCall     `json:"tool_calls,omitempty"`
+	ToolCallID string                 `json:"tool_call_id,omitempty"`
 }
 
-// openaiResponse is the response format from OpenAI API
 type openaiResponse struct {
 	Choices []openaiChoice `json:"choices"`
 	Usage   openaiUsage    `json:"usage"`
@@ -51,313 +61,255 @@ type openaiUsage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
-// NewOpenAIBackend creates a new OpenAI backend
-func NewOpenAIBackend(apiKey, model string) *OpenAIBackend {
+// ── Constructor ───────────────────────────────────────────────────────────────
+
+// NewOpenAIBackend creates a backend for OpenAI-compatible APIs.
+// baseURL selects the server — pass "" to use the OpenAI default.
+// For Ollama: baseURL = "http://localhost:11434", apiKey = "ollama".
+func NewOpenAIBackend(apiKey, model, baseURL string) *OpenAIBackend {
+	if baseURL == "" {
+		baseURL = defaultOpenAIBase
+	}
 	return &OpenAIBackend{
-		apiKey: apiKey,
-		model:  model,
-		client: &http.Client{
-			Timeout: 0, // No timeout for long-running completions
-		},
+		apiKey:  apiKey,
+		model:   model,
+		baseURL: strings.TrimRight(baseURL, "/"),
+		client:  &http.Client{Timeout: 0},
 	}
 }
 
-// Complete implements harness.LLMProvider
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// toWireMessages converts harness messages (which carry ToolCalls and
+// ToolCallID) into the openaiMessage slice sent over the wire.
+func toWireMessages(msgs []harness.ChatMessage) []openaiMessage {
+	out := make([]openaiMessage, len(msgs))
+	for i, m := range msgs {
+		out[i] = openaiMessage{
+			Role:       m.Role,
+			Content:    m.Content,
+			ToolCalls:  m.ToolCalls,
+			ToolCallID: m.ToolCallID,
+		}
+	}
+	return out
+}
+
+// fromWireMessage converts a response openaiMessage back to a harness.ChatMessage.
+func fromWireMessage(m openaiMessage) harness.ChatMessage {
+	return harness.ChatMessage{
+		Role:      m.Role,
+		Content:   m.Content,
+		ToolCalls: m.ToolCalls,
+	}
+}
+
+// post sends a JSON request to path and returns the raw HTTP response.
+func (ob *OpenAIBackend) post(ctx context.Context, path string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", ob.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if ob.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+ob.apiKey)
+	}
+	return ob.client.Do(req)
+}
+
+// ── LLMProvider ───────────────────────────────────────────────────────────────
+
+// Complete implements harness.LLMProvider (single-turn, non-streaming).
 func (ob *OpenAIBackend) Complete(ctx context.Context, req *harness.CompletionRequest) (*harness.CompletionResponse, error) {
-	maxTokens := req.MaxTokens
-	if maxTokens == 0 {
-		maxTokens = 256
-	}
-
-	openaiReq := openaiRequest{
+	payload, err := json.Marshal(openaiRequest{
 		Model:       ob.model,
-		MaxTokens:   maxTokens,
 		Temperature: req.Temperature,
-		Messages: []openaiMessage{
-			{
-				Role:    "user",
-				Content: harness.Text(req.Prompt),
-			},
-		},
-		Stream: false,
-	}
-
-	body, err := json.Marshal(openaiReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+ob.apiKey)
-
-	resp, err := ob.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("openai returned status %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var openaiResp openaiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&openaiResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if len(openaiResp.Choices) == 0 {
-		return nil, fmt.Errorf("openai returned no choices")
-	}
-
-	choice := openaiResp.Choices[0]
-
-	return &harness.CompletionResponse{
-		Text:         choice.Message.Content.PlainText(),
-		FinishReason: choice.FinishReason,
-		TokensUsed:   openaiResp.Usage.CompletionTokens,
-		Model:        ob.model,
-	}, nil
-}
-
-// StreamTokens implements harness.LLMProvider
-func (ob *OpenAIBackend) StreamTokens(ctx context.Context, req *harness.CompletionRequest) (<-chan string, error) {
-	tokenChan := make(chan string)
-
-	go func() {
-		defer close(tokenChan)
-
-		maxTokens := req.MaxTokens
-		if maxTokens == 0 {
-			maxTokens = 256
-		}
-
-		openaiReq := openaiRequest{
-			Model:       ob.model,
-			MaxTokens:   maxTokens,
-			Temperature: req.Temperature,
-			Messages: []openaiMessage{
-				{
-					Role:    "user",
-					Content: harness.Text(req.Prompt),
-				},
-			},
-			Stream: true,
-		}
-
-		body, err := json.Marshal(openaiReq)
-		if err != nil {
-			return
-		}
-
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/chat/completions", bytes.NewReader(body))
-		if err != nil {
-			return
-		}
-
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Authorization", "Bearer "+ob.apiKey)
-
-		resp, err := ob.client.Do(httpReq)
-		if err != nil {
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return
-		}
-
-		// Read streaming response (Server-Sent Events format)
-		decoder := json.NewDecoder(resp.Body)
-		for {
-			var streamEvent map[string]interface{}
-			if err := decoder.Decode(&streamEvent); err != nil {
-				if err == io.EOF {
-					break
-				}
-				return
-			}
-
-			// Parse SSE format data line
-			// Each line starts with "data: " followed by JSON
-			// Extract choices and delta.content
-			if choices, ok := streamEvent["choices"].([]interface{}); ok && len(choices) > 0 {
-				if choice, ok := choices[0].(map[string]interface{}); ok {
-					if delta, ok := choice["delta"].(map[string]interface{}); ok {
-						if content, ok := delta["content"].(string); ok && content != "" {
-							select {
-							case tokenChan <- content:
-							case <-ctx.Done():
-								return
-							}
-						}
-					}
-				}
-			}
-		}
-	}()
-
-	return tokenChan, nil
-}
-
-// Chat implements harness.LLMProvider — non-streaming multi-turn chat
-func (ob *OpenAIBackend) Chat(ctx context.Context, req *harness.ChatRequest) (*harness.ChatResponse, error) {
-	maxTokens := req.MaxTokens
-	if maxTokens == 0 {
-		maxTokens = 256
-	}
-
-	// Convert harness messages to openai messages
-	msgs := make([]openaiMessage, len(req.Messages))
-	for i, m := range req.Messages {
-		msgs[i] = openaiMessage{Role: m.Role, Content: m.Content}
-	}
-
-	openaiReq := openaiRequest{
-		Model:       ob.model,
-		MaxTokens:   maxTokens,
-		Temperature: req.Temperature,
-		Messages:    msgs,
+		MaxTokens:   req.MaxTokens,
+		Messages:    []openaiMessage{{Role: "user", Content: harness.Text(req.Prompt)}},
 		Stream:      false,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
 	}
 
-	body, err := json.Marshal(openaiReq)
+	resp, err := ob.post(ctx, "/v1/chat/completions", payload)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		"https://api.openai.com/v1/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+ob.apiKey)
-
-	resp, err := ob.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("openai returned status %d: %s", resp.StatusCode, b)
+		return nil, fmt.Errorf("openai status %d: %s", resp.StatusCode, b)
 	}
 
-	var openaiResp openaiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&openaiResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	var r openaiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
 	}
-	if len(openaiResp.Choices) == 0 {
+	if len(r.Choices) == 0 {
 		return nil, fmt.Errorf("openai returned no choices")
 	}
 
-	choice := openaiResp.Choices[0]
-	return &harness.ChatResponse{
-		Message: harness.ChatMessage{
-			Role:    choice.Message.Role,
-			Content: choice.Message.Content,
-		},
-		FinishReason: choice.FinishReason,
-		TokensUsed:   openaiResp.Usage.CompletionTokens,
+	return &harness.CompletionResponse{
+		Text:         r.Choices[0].Message.Content.PlainText(),
+		FinishReason: r.Choices[0].FinishReason,
+		TokensUsed:   r.Usage.CompletionTokens,
 		Model:        ob.model,
 	}, nil
 }
 
-// StreamChat implements harness.LLMProvider — streaming multi-turn chat via SSE
-func (ob *OpenAIBackend) StreamChat(ctx context.Context, req *harness.ChatRequest) (<-chan string, error) {
-	tokenChan := make(chan string)
+// StreamTokens implements harness.LLMProvider (single-turn, streaming).
+func (ob *OpenAIBackend) StreamTokens(ctx context.Context, req *harness.CompletionRequest) (<-chan string, error) {
+	payload, err := json.Marshal(openaiRequest{
+		Model:       ob.model,
+		Temperature: req.Temperature,
+		MaxTokens:   req.MaxTokens,
+		Messages:    []openaiMessage{{Role: "user", Content: harness.Text(req.Prompt)}},
+		Stream:      true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
 
+	resp, err := ob.post(ctx, "/v1/chat/completions", payload)
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("openai status %d: %s", resp.StatusCode, b)
+	}
+
+	ch := make(chan string)
 	go func() {
-		defer close(tokenChan)
-
-		maxTokens := req.MaxTokens
-		if maxTokens == 0 {
-			maxTokens = 256
-		}
-
-		msgs := make([]openaiMessage, len(req.Messages))
-		for i, m := range req.Messages {
-			msgs[i] = openaiMessage{Role: m.Role, Content: m.Content}
-		}
-
-		openaiReq := openaiRequest{
-			Model:       ob.model,
-			MaxTokens:   maxTokens,
-			Temperature: req.Temperature,
-			Messages:    msgs,
-			Stream:      true,
-		}
-
-		body, err := json.Marshal(openaiReq)
-		if err != nil {
-			return
-		}
-
-		httpReq, err := http.NewRequestWithContext(ctx, "POST",
-			"https://api.openai.com/v1/chat/completions", bytes.NewReader(body))
-		if err != nil {
-			return
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Authorization", "Bearer "+ob.apiKey)
-
-		resp, err := ob.client.Do(httpReq)
-		if err != nil {
-			return
-		}
 		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return
-		}
-
-		scanner := bufio.NewScanner(resp.Body)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if !strings.HasPrefix(line, "data: ") {
-				continue
-			}
-			payload := strings.TrimPrefix(line, "data: ")
-			if payload == "[DONE]" {
-				return
-			}
-
-			var chunk sseChunk
-			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-				continue
-			}
-
-			if len(chunk.Choices) > 0 {
-				if content := chunk.Choices[0].Delta.Content; content != "" {
-					select {
-					case tokenChan <- content:
-					case <-ctx.Done():
-						return
-					}
-				}
-			}
-		}
+		defer close(ch)
+		streamTextTokens(ctx, resp.Body, ch)
 	}()
-
-	return tokenChan, nil
+	return ch, nil
 }
 
-// ListModels implements harness.LLMProvider
-func (ob *OpenAIBackend) ListModels(ctx context.Context) ([]harness.ModelInfo, error) {
-	return []harness.ModelInfo{
-		{
-			ID:       ob.model,
-			Name:     ob.model,
-			Provider: "openai",
-			Type:     "chat",
-		},
+// Chat implements harness.LLMProvider (multi-turn, non-streaming, with tool support).
+func (ob *OpenAIBackend) Chat(ctx context.Context, req *harness.ChatRequest) (*harness.ChatResponse, error) {
+	oreq := openaiRequest{
+		Model:       ob.model,
+		Temperature: req.Temperature,
+		MaxTokens:   req.MaxTokens,
+		Messages:    toWireMessages(req.Messages),
+		Stream:      false,
+		Tools:       req.Tools,
+	}
+	if len(req.Tools) > 0 {
+		oreq.ToolChoice = "auto"
+	}
+
+	payload, err := json.Marshal(oreq)
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+
+	resp, err := ob.post(ctx, "/v1/chat/completions", payload)
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("openai status %d: %s", resp.StatusCode, b)
+	}
+
+	var r openaiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	if len(r.Choices) == 0 {
+		return nil, fmt.Errorf("openai returned no choices")
+	}
+
+	return &harness.ChatResponse{
+		Message:      fromWireMessage(r.Choices[0].Message),
+		FinishReason: r.Choices[0].FinishReason,
+		TokensUsed:   r.Usage.CompletionTokens,
+		Model:        ob.model,
 	}, nil
+}
+
+// StreamChat implements harness.LLMProvider (multi-turn, streaming, text only).
+// Tool calls are not supported in streaming mode — use Chat when tools are active.
+func (ob *OpenAIBackend) StreamChat(ctx context.Context, req *harness.ChatRequest) (<-chan string, error) {
+	payload, err := json.Marshal(openaiRequest{
+		Model:       ob.model,
+		Temperature: req.Temperature,
+		MaxTokens:   req.MaxTokens,
+		Messages:    toWireMessages(req.Messages),
+		Stream:      true,
+		// Tools intentionally omitted: the agentic loop uses non-streaming Chat.
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal: %w", err)
+	}
+
+	resp, err := ob.post(ctx, "/v1/chat/completions", payload)
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("openai status %d: %s", resp.StatusCode, b)
+	}
+
+	ch := make(chan string)
+	go func() {
+		defer resp.Body.Close()
+		defer close(ch)
+		streamTextTokens(ctx, resp.Body, ch)
+	}()
+	return ch, nil
+}
+
+// ListModels implements harness.LLMProvider.
+func (ob *OpenAIBackend) ListModels(_ context.Context) ([]harness.ModelInfo, error) {
+	return []harness.ModelInfo{{
+		ID:       ob.model,
+		Name:     ob.model,
+		Provider: "openai",
+		Type:     "chat",
+	}}, nil
+}
+
+// ── SSE streaming helper ──────────────────────────────────────────────────────
+
+// streamTextTokens reads an OpenAI-style SSE stream and sends each text
+// delta to ch. Stops on [DONE], context cancellation, or read error.
+func streamTextTokens(ctx context.Context, body io.Reader, ch chan<- string) {
+	scanner := bufio.NewScanner(body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			return
+		}
+
+		var chunk sseChunk
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			continue
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		if content := chunk.Choices[0].Delta.Content; content != "" {
+			select {
+			case ch <- content:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
 }

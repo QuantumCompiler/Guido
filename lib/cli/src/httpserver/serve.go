@@ -18,14 +18,16 @@ import (
 
 // Serve starts the OpenAI-compatible HTTP server on the port in cfg, registers
 // all routes, and blocks until SIGINT/SIGTERM or ctx is cancelled.
+// tc may be nil — when non-nil the handler runs the agentic tool loop
+// internally for every chat request and returns only the final answer.
 // onShutdown is called (if non-nil) after the HTTP server has stopped — use it
 // to clean up backends (e.g. kill the llama-server process).
-func Serve(ctx context.Context, cfg *harness.Config, h *harness.Harness, onShutdown func()) error {
+func Serve(ctx context.Context, cfg *harness.Config, h *harness.Harness, tc *ToolConfig, onShutdown func()) error {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
-	hnd := NewHandler(h)
+	hnd := NewHandler(h, tc)
 	r.Post("/v1/completions", hnd.HandleCompletion)
 	r.Post("/v1/chat/completions", hnd.HandleChat)
 	r.Get("/v1/models", hnd.HandleListModels)

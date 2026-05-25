@@ -75,7 +75,7 @@ func main() {
 		typ := bcfg.Type
 		if typ == "" {
 			switch name {
-			case "openai", "anthropic", "llamacpp", "mock", "huggingface":
+			case "openai", "anthropic", "llamacpp", "ollama", "mock", "huggingface":
 				typ = name
 			}
 		}
@@ -89,7 +89,7 @@ func main() {
 			if model == "" {
 				model = "gpt-4"
 			}
-			providers[name] = backends.NewOpenAIBackend(bcfg.APIKey, model)
+			providers[name] = backends.NewOpenAIBackend(bcfg.APIKey, model, bcfg.URL)
 
 		case "anthropic":
 			if bcfg.APIKey == "" {
@@ -143,6 +143,13 @@ func main() {
 			}
 			providers[name] = backends.NewLlamaCppBackend(llamacppURL, model)
 
+		case "ollama":
+			model := bcfg.Model
+			if model == "" {
+				model = "llama3.2"
+			}
+			providers[name] = backends.NewOllamaBackend(model, bcfg.URL, os.ExpandEnv(bcfg.ModelPath))
+
 		case "mock":
 			model := bcfg.Model
 			if model == "" {
@@ -175,7 +182,7 @@ func main() {
 	log.Printf("[guido] serve mode — models load on first request")
 
 	// ── HTTP server ───────────────────────────────────────────────────────────
-	if err := httpserver.Serve(context.Background(), cfg, h, func() {
+	if err := httpserver.Serve(context.Background(), cfg, h, nil, func() {
 		if err := toolMgr.Close(); err != nil {
 			log.Printf("Tool cleanup error: %v", err)
 		}

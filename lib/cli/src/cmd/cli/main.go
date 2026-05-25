@@ -30,8 +30,12 @@ var (
 	temperature  float32
 	maxTokens    int
 	systemPrompt string
-	enableSearch bool // --search: give the model web_search + fetch_url tools
-	toolMgr      *tools.Manager
+	// Tool mode flags — at most one may be set (enforced by MarkFlagsMutuallyExclusive).
+	// No flag → all available tools (web search + MCP from config).
+	flagSearch bool // --search : web search only
+	flagMCP    bool // --mcp    : MCP tools only
+	flagNative bool // --native : no tools
+	toolMgr    *tools.Manager
 )
 
 var (
@@ -127,24 +131,40 @@ var completeCmd = &cobra.Command{
 		if err != nil {
 			log.Fatalf("Failed to build message: %v", err)
 		}
-		req := &harness.ChatRequest{
-			Messages: []harness.ChatMessage{
-				{Role: "user", Content: content},
-			},
-			Model:       chatModel,
-			Temperature: temperature,
-			MaxTokens:   maxTokens,
-			Stream:      true,
+
+		useWeb, useMCP := resolveToolMode()
+		activeTools, mcpReg := setupTools(ctx, cfg, useWeb, useMCP)
+		if mcpReg != nil {
+			defer mcpReg.Close()
 		}
 
-		resp, err := h.StreamChat(ctx, req)
-		if err != nil {
-			log.Fatalf("Completion error: %v", err)
+		history := []harness.ChatMessage{{Role: "user", Content: content}}
+
+		if len(activeTools) > 0 {
+			// Agentic loop — run until the model gives a final answer.
+			text, err := runAgenticLoop(ctx, h, &history, chatModel, temperature, maxTokens, activeTools, mcpReg, true)
+			if err != nil {
+				log.Fatalf("Completion error: %v", err)
+			}
+			fmt.Println(text)
+		} else {
+			// No tools — stream the response directly.
+			req := &harness.ChatRequest{
+				Messages:    history,
+				Model:       chatModel,
+				Temperature: temperature,
+				MaxTokens:   maxTokens,
+				Stream:      true,
+			}
+			resp, err := h.StreamChat(ctx, req)
+			if err != nil {
+				log.Fatalf("Completion error: %v", err)
+			}
+			for token := range resp {
+				fmt.Print(stripStopTokens(token))
+			}
+			fmt.Println()
 		}
-		for token := range resp {
-			fmt.Print(stripStopTokens(token))
-		}
-		fmt.Println()
 	},
 }
 
@@ -198,36 +218,31 @@ var chatCmd = &cobra.Command{
 			os.Exit(0)
 		}()
 
-		// Connect to any configured MCP servers and collect their tools.
-		var mcpReg *mcp.Registry
-		if len(cfg.MCPServers) > 0 {
-			var regErr error
-			mcpReg, regErr = mcp.NewRegistry(ctx, cfg.MCPServers)
-			if regErr != nil {
-				log.Printf("[mcp] registry init error (non-fatal): %v", regErr)
-			} else {
-				defer mcpReg.Close()
-			}
-		}
-
-		// Build the combined tool list: built-in web tools (if --search) + MCP tools.
-		var activeTools []harness.Tool
-		if enableSearch {
-			activeTools = append(activeTools, tools.WebTools()...)
-		}
+		// Decide which tool sets to activate based on flags.
+		useWeb, useMCP := resolveToolMode()
+		activeTools, mcpReg := setupTools(ctx, cfg, useWeb, useMCP)
 		if mcpReg != nil {
-			activeTools = append(activeTools, mcpReg.Tools()...)
+			defer mcpReg.Close()
 		}
 
 		fmt.Printf("Guido (%s)  — type 'exit' to quit, Ctrl+C to interrupt\n", chatModel)
 		if systemPrompt != "" {
 			fmt.Printf("System: %s\n", systemPrompt)
 		}
-		if enableSearch {
-			fmt.Println("Web search enabled (web_search + fetch_url)")
+		// Summarise active tools on startup.
+		var toolSummary []string
+		if useWeb {
+			toolSummary = append(toolSummary, "web search")
 		}
 		if mcpReg != nil && len(mcpReg.Tools()) > 0 {
-			fmt.Printf("MCP tools available (%d)\n", len(mcpReg.Tools()))
+			toolSummary = append(toolSummary, fmt.Sprintf("MCP (%d tools)", len(mcpReg.Tools())))
+		}
+		if flagNative {
+			fmt.Println("Tools: disabled")
+		} else if len(toolSummary) > 0 {
+			fmt.Printf("Tools: %s\n", strings.Join(toolSummary, " + "))
+		} else if useMCP && mcpReg == nil {
+			fmt.Println("Tools: MCP (no servers configured)")
 		}
 		fmt.Println(strings.Repeat("─", 50))
 
@@ -273,79 +288,12 @@ var chatCmd = &cobra.Command{
 
 			if len(activeTools) > 0 {
 				// ── Agentic tool-calling loop ──────────────────────────────
-				// Non-streaming so we can inspect tool_calls before printing.
-				// Loops until the model gives a final answer with no tool calls.
-				replied := false
-				for {
-					req := &harness.ChatRequest{
-						Messages:    history,
-						Model:       chatModel,
-						Temperature: temperature,
-						MaxTokens:   maxTokens,
-						Tools:       activeTools,
-					}
-
-					resp, err := h.Chat(ctx, req)
-					if err != nil {
-						log.Printf("Error: %v", err)
-						history = history[:len(history)-1] // undo user message
-						break
-					}
-
-					// Record the assistant turn (may contain tool_calls).
-					history = append(history, resp.Message)
-
-					if len(resp.Message.ToolCalls) == 0 {
-						// Final answer — print and break.
-						text := strings.TrimSpace(stripStopTokens(resp.Message.Content.PlainText()))
-						fmt.Printf("\nGuido: %s\n", text)
-						replied = true
-						break
-					}
-
-					// Execute each tool call the model requested.
-					for _, tc := range resp.Message.ToolCalls {
-						var toolArgs map[string]interface{}
-						_ = json.Unmarshal([]byte(tc.Function.Arguments), &toolArgs)
-
-						// Show the user what's happening.
-						switch tc.Function.Name {
-						case "web_search":
-							q, _ := toolArgs["query"].(string)
-							fmt.Printf("\n[searching] %q...\n", q)
-						case "fetch_url":
-							u, _ := toolArgs["url"].(string)
-							fmt.Printf("\n[fetching] %s...\n", u)
-						default:
-							fmt.Printf("\n[tool] %s %v\n", tc.Function.Name, toolArgs)
-						}
-
-						// Dispatch: MCP tools first, then built-in tools.
-						var result string
-						var execErr error
-						if mcpReg != nil {
-							var handled bool
-							result, handled, execErr = mcpReg.ExecuteTool(ctx, tc.Function.Name, tc.Function.Arguments)
-							if !handled {
-								result, execErr = tools.ExecuteTool(tc.Function.Name, tc.Function.Arguments)
-							}
-						} else {
-							result, execErr = tools.ExecuteTool(tc.Function.Name, tc.Function.Arguments)
-						}
-						if execErr != nil {
-							result = "Error: " + execErr.Error()
-						}
-
-						history = append(history, harness.ChatMessage{
-							Role:       "tool",
-							ToolCallID: tc.ID,
-							Content:    harness.Text(result),
-						})
-					}
-					// Loop — send tool results back to the model.
-				}
-				if !replied {
-					// Error path — already undone above, nothing to add.
+				text, err := runAgenticLoop(ctx, h, &history, chatModel, temperature, maxTokens, activeTools, mcpReg, true)
+				if err != nil {
+					log.Printf("Error: %v", err)
+					history = history[:len(history)-1] // undo user message
+				} else {
+					fmt.Printf("\nGuido: %s\n", text)
 				}
 			} else {
 				// ── Normal streaming path (no tools) ──────────────────────
@@ -425,9 +373,44 @@ will be terminated automatically.`,
 		}
 		h.SetRouter(harness.NewSimpleRouter(cfg, providers))
 
-		log.Printf("[guido] serving %q — model loads on first request", cfg.Models.Default)
+		// Build the server-side tool set from flags (same logic as chat/complete).
+		ctx := context.Background()
+		useWeb, useMCP := resolveToolMode()
+		activeTools, mcpReg := setupTools(ctx, cfg, useWeb, useMCP)
+		if mcpReg != nil {
+			defer mcpReg.Close()
+		}
 
-		if err := httpserver.Serve(context.Background(), cfg, h, func() {
+		// Summarise active tools in the startup log.
+		var toolParts []string
+		if useWeb {
+			toolParts = append(toolParts, "web search")
+		}
+		if mcpReg != nil && len(mcpReg.Tools()) > 0 {
+			toolParts = append(toolParts, fmt.Sprintf("MCP (%d tools)", len(mcpReg.Tools())))
+		}
+		if flagNative || len(toolParts) == 0 {
+			log.Printf("[guido] serving %q — model loads on first request (no tools)", cfg.Models.Default)
+		} else {
+			log.Printf("[guido] serving %q — model loads on first request | tools: %s",
+				cfg.Models.Default, strings.Join(toolParts, " + "))
+		}
+
+		// Build tool config for the HTTP handler (nil when no tools active).
+		var tc *httpserver.ToolConfig
+		if len(activeTools) > 0 {
+			captured := mcpReg // capture for closure
+			tc = &httpserver.ToolConfig{
+				Tools: activeTools,
+				ExecTool: func(rctx context.Context, name, argsJSON string) (string, error) {
+					return dispatchTool(rctx, harness.ToolCall{
+						Function: harness.ToolCallFunction{Name: name, Arguments: argsJSON},
+					}, captured)
+				},
+			}
+		}
+
+		if err := httpserver.Serve(ctx, cfg, h, tc, func() {
 			if err := toolMgr.Close(); err != nil {
 				log.Printf("Backend cleanup error: %v", err)
 			}
@@ -484,7 +467,7 @@ func backendType(key string, cfg harness.BackendConfig) string {
 	}
 	// Backward-compat: key name IS the type for the original single-backend style
 	switch key {
-	case "openai", "anthropic", "llamacpp", "mock", "huggingface":
+	case "openai", "anthropic", "llamacpp", "ollama", "mock", "huggingface":
 		return key
 	}
 	return ""
@@ -501,6 +484,118 @@ func nextEmbeddedPort(used map[int]bool, basePort int) int {
 
 // filterBackends restricts cfg.Backends to only the target backend and updates
 // cfg.Models.Default to match. When all is true the map is left intact.
+// resolveToolMode translates the mutually-exclusive tool flags into two booleans.
+//
+//	(no flag) → useWeb=true,  useMCP=true   — all available tools
+//	--search  → useWeb=true,  useMCP=false  — web search only
+//	--mcp     → useWeb=false, useMCP=true   — MCP only
+//	--native  → useWeb=false, useMCP=false  — no tools
+func resolveToolMode() (useWeb, useMCP bool) {
+	switch {
+	case flagNative:
+		return false, false
+	case flagSearch:
+		return true, false
+	case flagMCP:
+		return false, true
+	default:
+		return true, true
+	}
+}
+
+// setupTools connects to MCP servers (if useMCP and any are configured) and
+// returns the combined active tool list plus the registry (may be nil).
+// The caller is responsible for calling mcpReg.Close() when done.
+func setupTools(ctx context.Context, cfg *harness.Config, useWeb, useMCP bool) (activeTools []harness.Tool, mcpReg *mcp.Registry) {
+	if useMCP && len(cfg.MCPServers) > 0 {
+		var regErr error
+		mcpReg, regErr = mcp.NewRegistry(ctx, cfg.MCPServers)
+		if regErr != nil {
+			log.Printf("[mcp] registry init error (non-fatal): %v", regErr)
+			mcpReg = nil
+		}
+	}
+	if useWeb {
+		activeTools = append(activeTools, tools.WebTools()...)
+	}
+	if mcpReg != nil {
+		activeTools = append(activeTools, mcpReg.Tools()...)
+	}
+	return activeTools, mcpReg
+}
+
+// dispatchTool executes a single tool call, trying MCP first then built-ins.
+func dispatchTool(ctx context.Context, tc harness.ToolCall, mcpReg *mcp.Registry) (string, error) {
+	if mcpReg != nil {
+		result, handled, err := mcpReg.ExecuteTool(ctx, tc.Function.Name, tc.Function.Arguments)
+		if handled {
+			return result, err
+		}
+	}
+	return tools.ExecuteTool(tc.Function.Name, tc.Function.Arguments)
+}
+
+// runAgenticLoop drives the model→tool→model cycle until the model stops
+// requesting tool calls. It appends each turn to *history in place and
+// returns the final assistant text.
+func runAgenticLoop(
+	ctx context.Context,
+	h *harness.Harness,
+	history *[]harness.ChatMessage,
+	chatModel string,
+	temperature float32,
+	maxTokens int,
+	activeTools []harness.Tool,
+	mcpReg *mcp.Registry,
+	printProgress bool,
+) (string, error) {
+	for {
+		req := &harness.ChatRequest{
+			Messages:    *history,
+			Model:       chatModel,
+			Temperature: temperature,
+			MaxTokens:   maxTokens,
+			Tools:       activeTools,
+		}
+		resp, err := h.Chat(ctx, req)
+		if err != nil {
+			return "", err
+		}
+		*history = append(*history, resp.Message)
+
+		if len(resp.Message.ToolCalls) == 0 {
+			return strings.TrimSpace(stripStopTokens(resp.Message.Content.PlainText())), nil
+		}
+
+		for _, tc := range resp.Message.ToolCalls {
+			if printProgress {
+				var toolArgs map[string]interface{}
+				_ = json.Unmarshal([]byte(tc.Function.Arguments), &toolArgs)
+				switch tc.Function.Name {
+				case "web_search":
+					q, _ := toolArgs["query"].(string)
+					fmt.Printf("\n[searching] %q...\n", q)
+				case "fetch_url":
+					u, _ := toolArgs["url"].(string)
+					fmt.Printf("\n[fetching] %s...\n", u)
+				default:
+					fmt.Printf("\n[tool] %s %v\n", tc.Function.Name, toolArgs)
+				}
+			}
+			result, execErr := dispatchTool(ctx, tc, mcpReg)
+			if execErr != nil {
+				result = "Error: " + execErr.Error()
+			}
+			*history = append(*history, harness.ChatMessage{
+				Role:       "tool",
+				ToolCallID: tc.ID,
+				Name:       tc.Function.Name,
+				Content:    harness.Text(result),
+			})
+		}
+	}
+}
+
 // target="" falls through to cfg.Models.Default.
 // Logs a fatal error if the target isn't found in the config.
 func filterBackends(cfg *harness.Config, target string, all bool) {
@@ -549,7 +644,7 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 			if modelName == "" {
 				modelName = "gpt-4"
 			}
-			providers[name] = backends.NewOpenAIBackend(bcfg.APIKey, modelName)
+			providers[name] = backends.NewOpenAIBackend(bcfg.APIKey, modelName, bcfg.URL)
 			h.RegisterProvider(name, providers[name])
 
 		case "anthropic":
@@ -636,6 +731,14 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 			providers[name] = backends.NewLlamaCppBackend(llamacppURL, modelName)
 			h.RegisterProvider(name, providers[name])
 
+		case "ollama":
+			modelName := bcfg.Model
+			if modelName == "" {
+				modelName = "llama3.2"
+			}
+			providers[name] = backends.NewOllamaBackend(modelName, bcfg.URL, os.ExpandEnv(bcfg.ModelPath))
+			h.RegisterProvider(name, providers[name])
+
 		case "mock":
 			modelName := bcfg.Model
 			if modelName == "" {
@@ -681,7 +784,6 @@ func init() {
 	chatCmd.Flags().Float32VarP(&temperature, "temperature", "t", 0.7, "Temperature for sampling")
 	chatCmd.Flags().IntVarP(&maxTokens, "max-tokens", "n", -1, "Maximum tokens to generate (-1 for unlimited)")
 	chatCmd.Flags().StringVarP(&systemPrompt, "system", "s", "", "System prompt to set the assistant's behavior")
-	chatCmd.Flags().BoolVar(&enableSearch, "search", false, "Give the model web_search and fetch_url tools (internet access)")
 
 	completeCmd.Flags().StringArrayVar(&contextStrings, "context", nil, "Raw string to inject as context before the prompt")
 	completeCmd.Flags().StringArrayVar(&contextFiles, "file", nil, "File to attach (text files injected as text, images base64-encoded)")
@@ -695,6 +797,16 @@ func init() {
 
 	serveCmd.Flags().StringVarP(&serveModel, "model", "m", "", "Backend to serve (default: models.default from config)")
 	serveCmd.Flags().BoolVar(&serveAllBackends, "all-backends", false, "Serve every configured backend instead of just the default")
+
+	// Tool mode flags — identical on chat, complete, and serve.
+	// At most one may be set per invocation (Cobra enforces the mutual exclusion).
+	// No flag → all available tools are active (web search + any configured MCP servers).
+	for _, cmd := range []*cobra.Command{chatCmd, completeCmd, serveCmd} {
+		cmd.Flags().BoolVar(&flagSearch, "search", false, "Web search tools only (MCP disabled)")
+		cmd.Flags().BoolVar(&flagMCP, "mcp", false, "MCP tools only (web search disabled)")
+		cmd.Flags().BoolVar(&flagNative, "native", false, "No tools — native model capabilities only")
+		cmd.MarkFlagsMutuallyExclusive("search", "mcp", "native")
+	}
 
 	rootCmd.AddCommand(completeCmd)
 	rootCmd.AddCommand(chatCmd)

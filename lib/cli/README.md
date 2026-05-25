@@ -11,10 +11,10 @@ A unified Go-based harness for local and cloud LLM models. Run a single model fr
 ```bash
 cd lib/cli
 make build    # compile llama.cpp + build guido binary
-make install  # install to ~/bin/guido + copy config to ~/.guido/config/
+make install  # install to ~/bin/guido + config to ~/.guido/config/
 ```
 
-`make install` places the binary at `~/bin/guido` and writes a starter config to `~/.guido/config/config.yaml` (skipped if the file already exists).
+`make install` places the binary at `~/bin/guido` and writes a starter config to `~/.guido/config/config.yaml` (skipped if the file already exists). It also creates `/usr/local/bin` symlinks for `guido`, `guido-harness`, and every tool in `exec/bin/llama-cpp-tools/`.
 
 ### Configure
 
@@ -58,7 +58,7 @@ guido serve          # OpenAI-compatible HTTP server on port 8080
 guido complete "<prompt>" [flags]
 ```
 
-Sends a single prompt and prints the response, then exits. Any embedded llama-server started for this invocation is stopped on exit.
+Sends a single prompt and prints the response, then exits. Any embedded llama-server started for this invocation is stopped on exit. When tools are active (the default), `complete` runs the full agentic loop and prints the final answer.
 
 ```bash
 # Use the default model
@@ -71,6 +71,12 @@ guido complete "Solve 3x + 7 = 22 step by step" -m my-reasoning-model
 guido complete "Summarize this document" --file report.pdf
 guido complete "What's in this image?" --image screenshot.png
 guido complete "Explain this code" --file main.go --context "Focus on error handling"
+
+# Tool mode control
+guido complete "What time is it?"            # all tools (default)
+guido complete "What time is it?" --search   # web search only
+guido complete "What time is it?" --mcp      # MCP tools only
+guido complete "What time is it?" --native   # no tools, plain model response
 ```
 
 **Flags**
@@ -84,6 +90,11 @@ guido complete "Explain this code" --file main.go --context "Focus on error hand
 | `--file` | | | File to attach (text → inline, image → base64) |
 | `--image` | | | Image file to attach (base64-encoded) |
 | `--all-backends` | | `false` | Initialize every configured backend instead of just the target |
+| `--search` | | | Web search tools only (disables MCP) |
+| `--mcp` | | | MCP tools only (disables web search) |
+| `--native` | | | No tools — native model capabilities only |
+
+`--search`, `--mcp`, and `--native` are mutually exclusive. Omitting all three enables all available tools.
 
 ---
 
@@ -95,28 +106,36 @@ guido chat [flags]
 
 Starts a multi-turn conversation in your terminal. Full message history is maintained in memory and re-sent each request (llama-server's prompt cache speeds up repeated prefixes). Type `exit` or press Ctrl+C to quit.
 
+When tools are active the response loop is non-streaming — the model can call tools before producing a final answer. Without tools, responses stream token-by-token.
+
 ```bash
-# Default model, no system prompt
+# All available tools (MCP from config + web search)
 guido chat
+
+# Web search only
+guido chat --search
+
+# MCP tools only
+guido chat --mcp
+
+# No tools — plain conversation
+guido chat --native
 
 # Specific model with a persona
 guido chat -m my-model --system "You are a concise technical assistant."
 
 # Attach context to the first message only
 guido chat --image diagram.png --file architecture.md
-
-# Enable web search tools
-guido chat --search
 ```
 
 **Flags** — same as `complete`, plus:
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--system` | `-s` | | System prompt |
-| `--search` | | `false` | Give the model `web_search` and `fetch_url` tools |
-
-MCP tools from servers listed under `mcp_servers:` in your config are always available in `chat` — no extra flag required. See [MCP Tools](#mcp-tools) below.
+| `--system` | `-s` | | System prompt injected as the first message |
+| `--search` | | | Web search tools only |
+| `--mcp` | | | MCP tools only |
+| `--native` | | | No tools |
 
 ---
 
@@ -128,12 +147,20 @@ guido serve [flags]
 
 Starts a persistent HTTP server. Embedded llama-server processes use **lazy loading** — they start on the first request and optionally unload after the configured idle timeout. The server itself starts instantly with no VRAM usage.
 
+When tool flags are active, the server runs the **agentic loop internally**: it calls tools on the model's behalf and returns only the final text response to clients. Clients do not need to implement tool calling themselves.
+
 ```bash
-# Serve the default model
+# All tools (default) — server handles MCP + web search internally
 guido serve
 
 # Serve a specific backend
 guido serve -m my-model
+
+# Web search only
+guido serve --search
+
+# No tool injection
+guido serve --native
 
 # Serve all configured backends (multi-model server)
 guido serve --all-backends
@@ -145,6 +172,9 @@ guido serve --all-backends
 |------|-------|---------|-------------|
 | `--model` | `-m` | config default | Backend to serve |
 | `--all-backends` | | `false` | Serve every configured backend |
+| `--search` | | | Web search tools only |
+| `--mcp` | | | MCP tools only |
+| `--native` | | | No tool injection |
 
 ---
 
@@ -155,6 +185,25 @@ guido models
 ```
 
 Queries all configured backends and prints their available models.
+
+---
+
+## Tool Modes
+
+All three commands (`complete`, `chat`, `serve`) share the same tool flag semantics:
+
+| Flag | Web Search | MCP Tools |
+|------|-----------|-----------|
+| *(none)* | ✓ | ✓ (if configured) |
+| `--search` | ✓ | ✗ |
+| `--mcp` | ✗ | ✓ (if configured) |
+| `--native` | ✗ | ✗ |
+
+Only one flag may be set at a time — Guido will error if two are combined.
+
+### How tool calling works with local models
+
+llama-server has a known serialization bug with its native tool-call API. Guido works around this transparently using **system-prompt injection**: tool definitions are described in a system message and the model is instructed to emit `TOOL_CALL: {"name": "...", "arguments": {...}}` lines. Guido parses these, dispatches the calls, and feeds results back — the end result is identical to native tool calling from the user's perspective.
 
 ---
 
@@ -182,6 +231,8 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+When `guido serve` is started with tool flags, this endpoint runs the full agentic loop and returns the final answer. The `tool_calls` turns are hidden from the client.
+
 Multimodal messages use the OpenAI content-part format:
 ```json
 {
@@ -202,7 +253,7 @@ curl http://localhost:8080/v1/models
 ```
 
 #### `GET /v1/model/status`
-Returns the load state of lazy backends (useful for showing a loading indicator in a GUI):
+Returns the load state of lazy backends (useful for a GUI loading indicator):
 ```bash
 # All backends
 curl http://localhost:8080/v1/model/status
@@ -214,7 +265,9 @@ curl "http://localhost:8080/v1/model/status?backend=my-model"
 Response:
 ```json
 {
-  "my-model": {"model": "gemma4", "status": "ready", "idle_seconds": 42}
+  "backends": {
+    "my-model": {"model": "gemma4", "status": "ready", "idle_seconds": 42}
+  }
 }
 ```
 
@@ -238,41 +291,62 @@ models:
 
 backends:
 
-  # ── Local model (embedded llama-server) ─────────────────────────────────
+  # ── Local model (embedded llama-server) ─────────────────────────────────────
   my-model:
     type: llamacpp
-    url: "embedded"                    # guido manages the llama-server process
-    port: 8002                         # port for this model's llama-server
-    model: "gemma4"                    # model name reported to clients
+    url: "embedded"                           # guido manages the llama-server process
+    port: 8002                                # port for this model's llama-server
+    model: "gemma4"                           # model name reported to clients
     model_path: "${HOME}/.../model.gguf"
-    mmproj_path: "${HOME}/.../mmproj.gguf"  # optional — required for vision models
-    idle_timeout_seconds: 300          # 0 = stay loaded until server stops
-    gpu_layers: 99                     # layers to offload to GPU
+    mmproj_path: "${HOME}/.../mmproj.gguf"    # optional — required for vision models
+    idle_timeout_seconds: 300                 # 0 = stay loaded until server stops
+    gpu_layers: 99                            # layers to offload to GPU
 
-  # ── External llama-server (you manage it) ────────────────────────────────
+  # ── External llama-server (you manage it) ───────────────────────────────────
   external:
     type: llamacpp
     url: "http://192.168.1.50:8000"
     model: "my-remote-model"
 
-  # ── OpenAI ───────────────────────────────────────────────────────────────
+  # ── Ollama (local daemon — run `ollama serve` first) ────────────────────────
+  # If model_path is set, Guido registers the GGUF with Ollama on first use.
+  ollama:
+    type: ollama
+    model: "llama3.2"                         # any model pulled with `ollama pull`
+    url: "http://localhost:11434"             # optional, this is the default
+    model_path: "${HOME}/.../model.gguf"      # optional — auto-registers via `ollama create`
+
+  # ── OpenAI ──────────────────────────────────────────────────────────────────
   openai:
     api_key: "${OPENAI_API_KEY}"
     model: "gpt-4o"
 
-  # ── Anthropic ────────────────────────────────────────────────────────────
+  # ── Anthropic ───────────────────────────────────────────────────────────────
   anthropic:
     api_key: "${ANTHROPIC_API_KEY}"
     model: "claude-3-5-sonnet-20241022"
 
-  # ── Mock (testing, no model file needed) ────────────────────────────────
+  # ── OpenAI-compatible endpoint (Azure, custom proxy, etc.) ──────────────────
+  openai-azure:
+    type: openai
+    api_key: "${AZURE_OPENAI_KEY}"
+    url: "https://my-resource.openai.azure.com/..."
+    model: "gpt-4"
+
+  # ── Mock (testing, no model file needed) ────────────────────────────────────
   mock:
     model: "test-model"
 
-# ── MCP servers (optional) ──────────────────────────────────────────────────
-# Connect to Model Context Protocol servers and make their tools available
-# in the chat agentic loop. Tools appear as mcp__<name>__<tool>.
+# ── MCP servers (optional) ──────────────────────────────────────────────────────
+# Connect to Model Context Protocol servers. Their tools are available
+# automatically when --mcp or no tool flag is used.
+# Tools appear as mcp__<name>__<tool>.
 mcp_servers:
+  - name: devtools
+    enabled: true
+    command: python3
+    args: ["/path/to/test-mcp-server.py"]
+
   - name: filesystem
     enabled: true
     command: npx
@@ -284,7 +358,7 @@ mcp_servers:
     args: ["mcp-server-git", "--repository", "."]
 
   - name: postgres
-    enabled: false                # set to true to activate
+    enabled: false                            # set to true to activate
     command: npx
     args: ["-y", "@modelcontextprotocol/server-postgres"]
     env: ["DATABASE_URL=${DATABASE_URL}"]
@@ -307,6 +381,68 @@ For `complete` and `chat` commands, loading is eager (loads immediately, cleans 
 
 ---
 
+## MCP Tools
+
+Guido can connect to [Model Context Protocol](https://modelcontextprotocol.io) servers and expose their tools to the model. Any server runnable via `npx`, `uvx`, Python, or a direct executable is supported (stdio transport).
+
+### Setup
+
+Add an `mcp_servers` section to `~/.guido/config/config.yaml`:
+
+```yaml
+mcp_servers:
+  - name: devtools
+    enabled: true
+    command: python3
+    args: ["/path/to/test-mcp-server.py"]
+```
+
+MCP tools are active by default — no extra flag required. Use `--native` to disable them, or `--mcp` to enable only MCP and disable web search.
+
+### Test server
+
+Guido ships with a ready-to-use test MCP server at `lib/cli/test-mcp-server.py`:
+
+| Tool | What it does |
+|------|-------------|
+| `get_time` | Returns the current UTC date and time (best forcing function — model cannot fake it) |
+| `calculate` | Evaluates a math expression using Python's `math` module |
+| `read_file` | Reads a file or lists a directory (capped at 4 KB) |
+| `echo` | Returns its input unchanged — useful for debugging the tool dispatch loop |
+
+Enable it in config:
+```yaml
+mcp_servers:
+  - name: devtools
+    enabled: true
+    command: python3
+    args: ["/path/to/lib/cli/test-mcp-server.py"]
+```
+
+Then test with:
+```bash
+guido chat
+You: What time is it right now?
+[tool] mcp__devtools__get_time {}
+Guido: The current UTC time is 23:06:16 on May 25, 2026.
+```
+
+### Tool naming
+
+Tools appear as `mcp__<server-name>__<tool-name>`:
+
+| MCP server | Tool name | As seen by the model |
+|---|---|---|
+| `devtools` | `get_time` | `mcp__devtools__get_time` |
+| `filesystem` | `read_file` | `mcp__filesystem__read_file` |
+| `git` | `git_log` | `mcp__git__git_log` |
+
+### Failed connections
+
+Servers that fail to connect (missing command, wrong args, etc.) are logged and skipped. Guido starts normally with whichever servers did connect.
+
+---
+
 ## Multimodal / Vision
 
 Vision models require a multimodal projector (mmproj) file alongside the main model:
@@ -319,7 +455,7 @@ backends:
     port: 8002
     model: "gemma4"
     model_path: "${HOME}/.../model-q4km.gguf"
-    mmproj_path: "${HOME}/.../model-mmproj.gguf"   # required for image input
+    mmproj_path: "${HOME}/.../model-mmproj.gguf"
 ```
 
 Then from the CLI:
@@ -332,49 +468,6 @@ Or via the API using OpenAI-compatible `image_url` content parts (data URIs supp
 
 ---
 
-## MCP Tools
-
-Guido can connect to [Model Context Protocol](https://modelcontextprotocol.io) servers and expose their tools to the model in the `chat` agentic loop. Any server runnable via `npx`, `uvx`, or a direct executable is supported (stdio transport).
-
-### Setup
-
-Add an `mcp_servers` section to `~/.guido/config/config.yaml`:
-
-```yaml
-mcp_servers:
-  - name: filesystem
-    enabled: true
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "${HOME}/Documents"]
-```
-
-Then run `guido chat` — no extra flag needed. Configured servers connect at startup and their tools are automatically included in every request.
-
-### Tool naming
-
-Tools appear as `mcp__<server-name>__<tool-name>`. For example:
-
-| MCP server | Tool name | As seen by the model |
-|---|---|---|
-| `filesystem` | `read_file` | `mcp__filesystem__read_file` |
-| `git` | `git_log` | `mcp__git__git_log` |
-| `postgres` | `query` | `mcp__postgres__query` |
-
-### Built-in tools alongside MCP
-
-`--search` and MCP tools are independent and compose freely:
-
-```bash
-guido chat --search   # web_search + fetch_url + all MCP tools
-guido chat            # MCP tools only (if mcp_servers configured)
-```
-
-### Failed connections
-
-Servers that fail to connect (missing `npx`, wrong args, etc.) are logged and skipped. Guido starts normally with whichever servers did connect.
-
----
-
 ## Architecture
 
 ```
@@ -383,11 +476,12 @@ lib/cli/
 ├── README.md
 ├── DEVELOPER.md           # Package-by-package developer reference
 ├── config.yaml            # Sample configuration (copied to ~/.guido/config/ on install)
+├── test-mcp-server.py     # Built-in MCP test server (get_time, calculate, read_file, echo)
 ├── go.mod / go.sum
 │
 ├── src/                   # All Go source code
 │   ├── harness/           # Core interfaces, types, and config
-│   ├── backends/          # LLM provider implementations (llamacpp, openai, anthropic, …)
+│   ├── backends/          # LLM provider implementations (llamacpp, openai, anthropic, ollama, …)
 │   ├── httpserver/        # HTTP route registration and handlers
 │   ├── tools/             # llama-server lifecycle and built-in tool calling
 │   ├── mcp/               # MCP client (connects to external MCP servers)
@@ -423,7 +517,7 @@ import (
 cfg, _ := harness.LoadConfig("~/.guido/config/config.yaml")
 h := harness.NewHarness(cfg)
 
-provider := backends.NewOpenAIBackend(os.Getenv("OPENAI_API_KEY"), "gpt-4o")
+provider := backends.NewOpenAIBackend(os.Getenv("OPENAI_API_KEY"), "gpt-4o", "")
 h.RegisterProvider("openai", provider)
 h.SetRouter(harness.NewSimpleRouter(cfg, map[string]harness.LLMProvider{"openai": provider}))
 
@@ -454,7 +548,7 @@ type LLMProvider interface {
 }
 ```
 
-Register it in `initializeBackends` in `cmd/cli/main.go` and add a config entry.
+Register it in `initializeBackends` in `cmd/cli/main.go` (and mirror in `cmd/harness/main.go`), and add a config entry under `backends:`.
 
 ---
 
@@ -464,6 +558,10 @@ Register it in `initializeBackends` in `cmd/cli/main.go` and add a config entry.
 - Check `guido serve` logs — llama-server stderr is forwarded
 - For vision models, confirm `mmproj_path` points to a valid mmproj file
 - Run `curl http://localhost:<port>/health` to check the embedded server directly
+
+**Tool calls failing with HTTP 500**
+- This is a known llama-server version bug with its native tool API
+- Guido works around it automatically via system-prompt injection — no action needed
 
 **Port conflict**
 ```

@@ -3,7 +3,7 @@ server:
   mode: http              # 'http' for service, 'cli' for command-line
 
 models:
-  default: gemma4-reasoning
+  default: llama33
 
 backends:
   # ─────────────────────────────────────────────────────────────────────
@@ -14,19 +14,28 @@ backends:
   # The key name alone is enough for a single backend (backward compat).
   # ─────────────────────────────────────────────────────────────────────
 
-  gemma4-reasoning:
+  gemma4:
+    type: llamacpp
+    url: "embedded"
+    port: 8002
+    model: "gemma4"
+    model_path: "${HOME}/.cache/huggingface/hub/models/google/gguf/gemma4:31b-q4km.gguf"
+    # mmproj_path:
+    idle_timeout_seconds: 60
+
+  llama33:
     type: llamacpp
     url: "embedded"
     port: 8003
-    model: "gemma4"
-    model_path: "${HOME}/.cache/huggingface/hub/models/google/gemma4-31b/gguf/gemma4:31b-q4km-reasoning.gguf"
+    model: "llama3.3"
+    model_path: "${HOME}/.cache/huggingface/hub/models/meta/gguf/llam3.3:70b-q4km.gguf"
     # mmproj_path:
     idle_timeout_seconds: 60
 
   gpt-oss:
     type: llamacpp
     url: "embedded"
-    port: 8003
+    port: 8010
     model: "gemma4"
     model_path: "${HOME}/.cache/huggingface/hub/models/openai/gguf/gpt-oss:20b-f16.gguf"
     # mmproj_path:
@@ -42,18 +51,27 @@ backends:
   #   model: "my-remote-model"
 
   # ─────────────────────────────────────────────────────────────────────
+  # OLLAMA (local daemon — run `ollama serve` first)
+  # ─────────────────────────────────────────────────────────────────────
+
+  # ollama:
+  #   type: ollama
+  #   model: "llama3.2"           # any model you've pulled with `ollama pull`
+  #   url: "http://localhost:11434"  # optional — this is the default
+
+  # ─────────────────────────────────────────────────────────────────────
   # CLOUD APIs
   # ─────────────────────────────────────────────────────────────────────
 
   # openai:
   #   api_key: "${OPENAI_API_KEY}"
-  #   model: "gpt-4"
+  #   model: "gpt-4o"
 
   # anthropic:
   #   api_key: "${ANTHROPIC_API_KEY}"
-  #   model: "claude-3-sonnet-20240229"
+  #   model: "claude-3-5-sonnet-20241022"
 
-  # Multiple OpenAI-style providers (e.g. Azure endpoint alongside OpenAI):
+  # OpenAI-compatible endpoint (Azure, custom proxy, etc.):
   # openai-azure:
   #   type: openai
   #   api_key: "${AZURE_OPENAI_KEY}"
@@ -66,3 +84,9 @@ backends:
 
   mock:
     model: "test-model"
+
+mcp_servers:
+  - name: devtools
+    enabled: true
+    command: python3
+    args: ["/Users/taylor/Data/Development/Projects/Guido/lib/cli/test-mcp-server.py"]

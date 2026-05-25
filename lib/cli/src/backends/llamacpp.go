@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 
 	"guido/lib/cli/src/harness"
@@ -171,9 +172,10 @@ type llamaCppChatRequest struct {
 	//   <end_of_turn>   Gemma native template
 	//   <|end|>         Phi-3
 	//   </s>            Legacy SentencePiece models
-	// NOTE: omitted when Tools are present — the model's function-calling template
-	// manages its own stop tokens and explicit stops can interfere.
-	Stop  []string       `json:"stop,omitempty"`
+	Stop []string `json:"stop,omitempty"`
+	// Tools is included for future use when llama-server's native tool-call
+	// serialization is stable. Currently Chat() uses system-prompt injection
+	// (chatWithToolPrompt) instead of this field.
 	Tools []harness.Tool `json:"tools,omitempty"`
 }
 
@@ -190,20 +192,21 @@ var defaultStopSequences = []string{
 	"\nHuman:",       // Some RLHF formats
 }
 
-// Chat implements harness.LLMProvider — non-streaming multi-turn chat
+// Chat implements harness.LLMProvider — non-streaming multi-turn chat.
+// When req.Tools is non-empty, tool calling is handled via system-prompt
+// injection rather than the native API (llama-server has a serialization bug
+// with tool calls in some versions that returns HTTP 500).
 func (lcb *LlamaCppBackend) Chat(ctx context.Context, req *harness.ChatRequest) (*harness.ChatResponse, error) {
+	if len(req.Tools) > 0 {
+		return lcb.chatWithToolPrompt(ctx, req)
+	}
+
 	chatReq := llamaCppChatRequest{
 		Messages:    req.Messages,
 		Temperature: req.Temperature,
 		MaxTokens:   req.MaxTokens,
 		Stream:      false,
-		Tools:       req.Tools,
-	}
-	// Only set explicit stop sequences when no tools are present.
-	// When tools are active the model's function-calling template manages its
-	// own stop tokens; injecting ours can cut the tool-call JSON short.
-	if len(req.Tools) == 0 {
-		chatReq.Stop = defaultStopSequences
+		Stop:        defaultStopSequences,
 	}
 
 	body, err := json.Marshal(chatReq)
@@ -229,13 +232,11 @@ func (lcb *LlamaCppBackend) Chat(ctx context.Context, req *harness.ChatRequest) 
 		return nil, fmt.Errorf("llama.cpp returned status %d: %s", resp.StatusCode, b)
 	}
 
-	// Inline response type that captures tool_calls alongside the standard fields.
 	var result struct {
 		Choices []struct {
 			Message struct {
-				Role      string                 `json:"role"`
-				Content   harness.MessageContent `json:"content"`
-				ToolCalls []harness.ToolCall     `json:"tool_calls"`
+				Role    string                 `json:"role"`
+				Content harness.MessageContent `json:"content"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -250,13 +251,196 @@ func (lcb *LlamaCppBackend) Chat(ctx context.Context, req *harness.ChatRequest) 
 		return nil, fmt.Errorf("llama.cpp returned no choices")
 	}
 
-	msg := harness.ChatMessage{
-		Role:      result.Choices[0].Message.Role,
-		Content:   result.Choices[0].Message.Content,
-		ToolCalls: result.Choices[0].Message.ToolCalls,
-	}
 	return &harness.ChatResponse{
-		Message:      msg,
+		Message: harness.ChatMessage{
+			Role:    result.Choices[0].Message.Role,
+			Content: result.Choices[0].Message.Content,
+		},
+		FinishReason: result.Choices[0].FinishReason,
+		TokensUsed:   result.Usage.CompletionTokens,
+		Model:        lcb.model,
+	}, nil
+}
+
+// ── Tool calling via system-prompt injection ───────────────────────────────────
+
+// toolCallLine matches a TOOL_CALL: line anywhere in the model's response.
+// The captured group is the raw JSON object: {"name": "...", "arguments": {...}}
+var toolCallLine = regexp.MustCompile(`(?m)^TOOL_CALL:\s*(\{.+\})\s*$`)
+
+// toolSystemPrompt returns a system-message block describing the available tools
+// and the TOOL_CALL: output format the model should use.
+func toolSystemPrompt(tools []harness.Tool) string {
+	var sb strings.Builder
+	sb.WriteString("You have access to the following tools. When you need to call a tool, output EXACTLY ONE line in this format and nothing else before or after:\n")
+	sb.WriteString("TOOL_CALL: {\"name\": \"<tool_name>\", \"arguments\": <arguments_json_object>}\n\n")
+	sb.WriteString("Available tools:\n")
+	for _, t := range tools {
+		sb.WriteString(fmt.Sprintf("- %s: %s\n", t.Function.Name, t.Function.Description))
+		if len(t.Function.Parameters) > 0 && string(t.Function.Parameters) != "null" {
+			sb.WriteString(fmt.Sprintf("  Parameters schema: %s\n", string(t.Function.Parameters)))
+		}
+	}
+	sb.WriteString("\nWhen you have enough information to answer without a tool, reply normally.")
+	return sb.String()
+}
+
+// rewriteMessagesForTools rewrites the message list so llama-server can process
+// it without native tool-call support:
+//   - role="tool" → role="user" with "Tool result for <name>: <content>"
+//   - role="assistant" with tool_calls → plain text with TOOL_CALL: lines
+//   - all other messages pass through unchanged
+func rewriteMessagesForTools(msgs []harness.ChatMessage) []harness.ChatMessage {
+	out := make([]harness.ChatMessage, 0, len(msgs))
+	for _, m := range msgs {
+		switch m.Role {
+		case "tool":
+			name := m.Name
+			if name == "" {
+				name = "tool"
+			}
+			out = append(out, harness.ChatMessage{
+				Role:    "user",
+				Content: harness.Text(fmt.Sprintf("Tool result for %s: %s", name, m.Content.PlainText())),
+			})
+		case "assistant":
+			if len(m.ToolCalls) > 0 {
+				var sb strings.Builder
+				for _, tc := range m.ToolCalls {
+					sb.WriteString(fmt.Sprintf("TOOL_CALL: {\"name\": %q, \"arguments\": %s}\n",
+						tc.Function.Name, tc.Function.Arguments))
+				}
+				out = append(out, harness.ChatMessage{
+					Role:    "assistant",
+					Content: harness.Text(strings.TrimRight(sb.String(), "\n")),
+				})
+			} else {
+				out = append(out, m)
+			}
+		default:
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// parseToolCalls scans text for TOOL_CALL: lines and returns ToolCall structs.
+func parseToolCalls(text string) []harness.ToolCall {
+	matches := toolCallLine.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	calls := make([]harness.ToolCall, 0, len(matches))
+	for i, m := range matches {
+		var raw struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if err := json.Unmarshal([]byte(m[1]), &raw); err != nil {
+			log.Printf("[llamacpp] failed to parse TOOL_CALL JSON: %v — raw: %s", err, m[1])
+			continue
+		}
+		argsStr := string(raw.Arguments)
+		if argsStr == "" || argsStr == "null" {
+			argsStr = "{}"
+		}
+		calls = append(calls, harness.ToolCall{
+			ID:   fmt.Sprintf("call_%d", i),
+			Type: "function",
+			Function: harness.ToolCallFunction{
+				Name:      raw.Name,
+				Arguments: argsStr,
+			},
+		})
+	}
+	return calls
+}
+
+// chatWithToolPrompt implements tool calling via system-prompt injection.
+// It rewrites the message list to avoid native tool-call API fields, injects
+// a system prompt describing the available tools, then parses any TOOL_CALL:
+// lines from the model's response.
+func (lcb *LlamaCppBackend) chatWithToolPrompt(ctx context.Context, req *harness.ChatRequest) (*harness.ChatResponse, error) {
+	msgs := rewriteMessagesForTools(req.Messages)
+
+	// Inject the tool-description system prompt.
+	prompt := toolSystemPrompt(req.Tools)
+	if len(msgs) > 0 && msgs[0].Role == "system" {
+		msgs[0].Content = harness.Text(prompt + "\n\n" + msgs[0].Content.PlainText())
+	} else {
+		msgs = append([]harness.ChatMessage{{Role: "system", Content: harness.Text(prompt)}}, msgs...)
+	}
+
+	chatReq := llamaCppChatRequest{
+		Messages:    msgs,
+		Temperature: req.Temperature,
+		MaxTokens:   req.MaxTokens,
+		Stream:      false,
+		Stop:        defaultStopSequences,
+		// Tools intentionally omitted — we're using prompt injection
+	}
+
+	body, err := json.Marshal(chatReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal chat request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/v1/chat/completions", lcb.baseURL), bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create chat request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := lcb.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("chat request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("llama.cpp returned status %d: %s", resp.StatusCode, b)
+	}
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Role    string                 `json:"role"`
+				Content harness.MessageContent `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage struct {
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode chat response: %w", err)
+	}
+	if len(result.Choices) == 0 {
+		return nil, fmt.Errorf("llama.cpp returned no choices")
+	}
+
+	text := result.Choices[0].Message.Content.PlainText()
+	if toolCalls := parseToolCalls(text); len(toolCalls) > 0 {
+		return &harness.ChatResponse{
+			Message: harness.ChatMessage{
+				Role:      "assistant",
+				Content:   harness.Text(""),
+				ToolCalls: toolCalls,
+			},
+			FinishReason: "tool_calls",
+			TokensUsed:   result.Usage.CompletionTokens,
+			Model:        lcb.model,
+		}, nil
+	}
+
+	return &harness.ChatResponse{
+		Message: harness.ChatMessage{
+			Role:    result.Choices[0].Message.Role,
+			Content: result.Choices[0].Message.Content,
+		},
 		FinishReason: result.Choices[0].FinishReason,
 		TokensUsed:   result.Usage.CompletionTokens,
 		Model:        lcb.model,
