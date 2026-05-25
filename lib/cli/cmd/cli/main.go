@@ -18,6 +18,7 @@ import (
 
 	"guido/lib/cli/backends"
 	"guido/lib/cli/harness"
+	"guido/lib/cli/httpserver"
 	"guido/lib/cli/tools"
 )
 
@@ -87,31 +88,41 @@ var completeCmd = &cobra.Command{
 			log.Fatal("No backends configured")
 		}
 
+		// Kill any llama-server we started when this command exits.
+		// If the server was already running we didn't add it to toolMgr.launched,
+		// so Close() is a no-op in that case.
+		defer toolMgr.Close()
+
 		router := harness.NewSimpleRouter(cfg, providers)
 		h.SetRouter(router)
 
-		// Create completion request
-		req := &harness.CompletionRequest{
-			Prompt:      prompt,
-			Model:       model,
+		// Resolve model name
+		chatModel := model
+		if chatModel == "" {
+			chatModel = cfg.Models.Default
+		}
+
+		// Use the chat endpoint so instruction-tuned models receive a properly
+		// formatted prompt rather than bare text (which they tend to ignore).
+		ctx := context.Background()
+		req := &harness.ChatRequest{
+			Messages: []harness.ChatMessage{
+				{Role: "user", Content: prompt},
+			},
+			Model:       chatModel,
 			Temperature: temperature,
 			MaxTokens:   maxTokens,
-			StreamMode:  false,
+			Stream:      true,
 		}
 
-		if req.Model == "" {
-			req.Model = cfg.Models.Default
-		}
-
-		// Get completion
-		ctx := context.Background()
-
-		resp, err := h.Complete(ctx, req)
+		resp, err := h.StreamChat(ctx, req)
 		if err != nil {
 			log.Fatalf("Completion error: %v", err)
 		}
-
-		fmt.Println(resp.Text)
+		for token := range resp {
+			fmt.Print(stripStopTokens(token))
+		}
+		fmt.Println()
 	},
 }
 
@@ -131,6 +142,10 @@ var chatCmd = &cobra.Command{
 		if len(providers) == 0 {
 			log.Fatal("No backends configured")
 		}
+
+		// Kill any llama-server we started when the session ends.
+		defer toolMgr.Close()
+
 		router := harness.NewSimpleRouter(cfg, providers)
 		h.SetRouter(router)
 
@@ -289,6 +304,44 @@ var chatCmd = &cobra.Command{
 	},
 }
 
+// serveCmd starts the OpenAI-compatible HTTP harness server.
+// It is equivalent to running guido-harness but is embedded directly in the
+// CLI binary so you only need one executable.
+var serveCmd = &cobra.Command{
+	Use:   "serve",
+	Short: "Start the OpenAI-compatible HTTP harness server",
+	Long: `Starts an HTTP server on the port configured in config.yaml (default 8080).
+The server exposes OpenAI-compatible endpoints:
+  POST /v1/completions
+  POST /v1/chat/completions
+  GET  /v1/models
+  GET  /health
+
+Press Ctrl+C to stop — any llama-server processes started by this session
+will be terminated automatically.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		cfg, err := harness.LoadConfig(configPath)
+		if err != nil {
+			log.Fatalf("Failed to load config: %v", err)
+		}
+
+		h := harness.NewHarness(cfg)
+		providers := initializeBackends(h, cfg, toolMgr)
+		if len(providers) == 0 {
+			log.Fatal("No backends configured")
+		}
+		h.SetRouter(harness.NewSimpleRouter(cfg, providers))
+
+		if err := httpserver.Serve(context.Background(), cfg, h, func() {
+			if err := toolMgr.Close(); err != nil {
+				log.Printf("Backend cleanup error: %v", err)
+			}
+		}); err != nil {
+			log.Fatalf("Server error: %v", err)
+		}
+	},
+}
+
 var modelsCmd = &cobra.Command{
 	Use:   "models",
 	Short: "List available models",
@@ -429,12 +482,10 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 						if gpuLayers == 0 {
 							gpuLayers = 99
 						}
-						log.Printf("Starting embedded llama-server for %q on port %d...", name, port)
 						_, err := tm.StartLlamaServer(expandedModelPath, port, gpuLayers, bcfg.ChatTemplate)
 						if err != nil {
-							log.Fatalf("Failed to start embedded llama-server for %q: %v\n", name, err)
+							log.Fatalf("Failed to start llama-server for %q: %v\n", name, err)
 						}
-						log.Printf("Embedded llama-server for %q listening at %s (model loading in background)", name, llamacppURL)
 					}
 				}
 			}
@@ -481,6 +532,7 @@ func init() {
 
 	rootCmd.AddCommand(completeCmd)
 	rootCmd.AddCommand(chatCmd)
+	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(modelsCmd)
 }
 

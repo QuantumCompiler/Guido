@@ -79,12 +79,12 @@ func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, c
 		args = append(args, "--chat-template", chatTemplate)
 	}
 
-	// Log the exact command so it's visible in the terminal for debugging.
-	fmt.Printf("[guido] starting llama-server: %s %v\n", toolPath, args)
-
+	// Suppress llama-server's own verbose output — we emit clean progress lines.
 	cmd := exec.Command(toolPath, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+
+	fmt.Printf("[guido] starting llama-server on port %d...\n", port)
 
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("failed to start llama-server: %w", err)
@@ -97,15 +97,20 @@ func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, c
 		exitErr <- cmd.Wait()
 	}()
 
-	// Poll until the server is accepting HTTP connections (200 or 503 = loading).
-	// Give up after 30 seconds — if it hasn't bound the port by then, something
-	// is wrong (bad flag, immediate crash, etc.).
+	// Poll until /health returns 200 OK (model fully loaded and ready).
+	// 503 means the port is bound but the model is still being loaded into
+	// VRAM — keep waiting.  Large models (31B+) can take several minutes.
 	healthURL := fmt.Sprintf("http://localhost:%d/health", port)
 	client := &http.Client{Timeout: 1 * time.Second}
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(10 * time.Minute)
+	startTime := time.Now()
+	lastLog := time.Now()
+	var ready bool
+
+	fmt.Printf("[guido] loading model (this may take a minute)...\n")
 
 	for time.Now().Before(deadline) {
-		// Did the process exit already?
+		// Did the process crash before becoming ready?
 		select {
 		case err := <-exitErr:
 			if err != nil {
@@ -115,24 +120,35 @@ func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, c
 		default:
 		}
 
-		// Is it listening yet?
 		resp, err := client.Get(healthURL)
 		if err == nil {
 			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusServiceUnavailable {
-				// 200 = ready, 503 = model still loading but server is up
-				fmt.Printf("[guido] llama-server is listening on port %d (model may still be loading)\n", port)
-				// Put the exit watcher back so the process still gets reaped.
-				go func() { <-exitErr }()
-				break
+			switch resp.StatusCode {
+			case http.StatusOK:
+				// Model is fully loaded and accepting requests.
+				ready = true
+			case http.StatusServiceUnavailable:
+				// Server is up but still loading — log progress every 15 s.
+				if time.Since(lastLog) >= 15*time.Second {
+					fmt.Printf("[guido] still loading... (%s elapsed)\n",
+						time.Since(startTime).Round(time.Second))
+					lastLog = time.Now()
+				}
 			}
+		}
+
+		if ready {
+			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	if cmd.Process == nil {
-		return 0, errors.New("llama-server process not running")
+	if !ready {
+		cmd.Process.Kill() //nolint:errcheck
+		return 0, fmt.Errorf("llama-server did not become ready within %s", time.Since(startTime).Round(time.Second))
 	}
+
+	fmt.Printf("[guido] llama-server ready on port %d (%s)\n", port, time.Since(startTime).Round(time.Second))
 
 	// Store process reference
 	m.launched["llama-server"] = &ManagedProcess{
