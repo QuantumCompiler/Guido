@@ -39,6 +39,12 @@ var (
 	contextImages  []string // --image
 )
 
+var (
+	allBackends      bool   // --all-backends: initialize every configured backend (complete/chat)
+	serveModel       string // --model: which backend to serve (default: config default)
+	serveAllBackends bool   // --all-backends: serve every configured backend
+)
+
 var rootCmd = &cobra.Command{
 	Use:   "guido",
 	Short: "Guido - LLM Model Harness",
@@ -84,6 +90,10 @@ var completeCmd = &cobra.Command{
 		if err != nil {
 			log.Fatalf("Failed to load config: %v", err)
 		}
+
+		// Narrow to the requested backend (default: models.default from config).
+		// --all-backends opts out of filtering so every configured backend is available.
+		filterBackends(cfg, model, allBackends)
 
 		// Initialize harness
 		h := harness.NewHarness(cfg)
@@ -146,6 +156,10 @@ var chatCmd = &cobra.Command{
 		if err != nil {
 			log.Fatalf("Failed to load config: %v", err)
 		}
+
+		// Narrow to the requested backend (default: models.default from config).
+		// --all-backends opts out of filtering so every configured backend is available.
+		filterBackends(cfg, model, allBackends)
 
 		// Initialize harness
 		h := harness.NewHarness(cfg)
@@ -358,16 +372,23 @@ will be terminated automatically.`,
 			log.Fatalf("Failed to load config: %v", err)
 		}
 
+		// Determine which backend(s) to expose.
+		// Default: only the backend named in models.default — so that adding
+		// extra models to config.yaml doesn't accidentally serve all of them.
+		// --model <name>   : serve a specific backend instead of the default
+		// --all-backends   : serve every configured backend (opt-in)
+		filterBackends(cfg, serveModel, serveAllBackends)
+
 		h := harness.NewHarness(cfg)
 		// Lazy mode: embedded llamacpp backends start on the first request.
-		// idle_timeout_minutes in config controls automatic VRAM unloading.
+		// idle_timeout_seconds in config controls automatic VRAM unloading.
 		providers := initializeBackends(h, cfg, toolMgr, true)
 		if len(providers) == 0 {
 			log.Fatal("No backends configured")
 		}
 		h.SetRouter(harness.NewSimpleRouter(cfg, providers))
 
-		log.Printf("[guido] serve mode — models load on first request")
+		log.Printf("[guido] serving %q — model loads on first request", cfg.Models.Default)
 
 		if err := httpserver.Serve(context.Background(), cfg, h, func() {
 			if err := toolMgr.Close(); err != nil {
@@ -439,6 +460,32 @@ func nextEmbeddedPort(used map[int]bool, basePort int) int {
 		p++
 	}
 	return p
+}
+
+// filterBackends restricts cfg.Backends to only the target backend and updates
+// cfg.Models.Default to match. When all is true the map is left intact.
+// target="" falls through to cfg.Models.Default.
+// Logs a fatal error if the target isn't found in the config.
+func filterBackends(cfg *harness.Config, target string, all bool) {
+	if all {
+		return
+	}
+	if target == "" {
+		target = cfg.Models.Default
+	}
+	if target == "" {
+		log.Fatal("No default model set in config and --model not specified")
+	}
+	bcfg, ok := cfg.Backends[target]
+	if !ok {
+		var names []string
+		for k := range cfg.Backends {
+			names = append(names, k)
+		}
+		log.Fatalf("Backend %q not found in config. Available: %v", target, names)
+	}
+	cfg.Backends = map[string]harness.BackendConfig{target: bcfg}
+	cfg.Models.Default = target
 }
 
 // initializeBackends registers all configured backends with the harness.
@@ -602,10 +649,15 @@ func init() {
 	completeCmd.Flags().StringArrayVar(&contextStrings, "context", nil, "Raw string to inject as context before the prompt")
 	completeCmd.Flags().StringArrayVar(&contextFiles, "file", nil, "File to attach (text files injected as text, images base64-encoded)")
 	completeCmd.Flags().StringArrayVar(&contextImages, "image", nil, "Image file to attach (base64-encoded)")
+	completeCmd.Flags().BoolVar(&allBackends, "all-backends", false, "Initialize every configured backend instead of just the target model's backend")
 
 	chatCmd.Flags().StringArrayVar(&contextStrings, "context", nil, "Raw string to inject as context in the first message")
 	chatCmd.Flags().StringArrayVar(&contextFiles, "file", nil, "File to attach to the first message")
 	chatCmd.Flags().StringArrayVar(&contextImages, "image", nil, "Image to attach to the first message")
+	chatCmd.Flags().BoolVar(&allBackends, "all-backends", false, "Initialize every configured backend instead of just the target model's backend")
+
+	serveCmd.Flags().StringVarP(&serveModel, "model", "m", "", "Backend to serve (default: models.default from config)")
+	serveCmd.Flags().BoolVar(&serveAllBackends, "all-backends", false, "Serve every configured backend instead of just the default")
 
 	rootCmd.AddCommand(completeCmd)
 	rootCmd.AddCommand(chatCmd)

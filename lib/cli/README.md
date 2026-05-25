@@ -1,458 +1,426 @@
-# Guido - LLM Model Harness
+# Guido — LLM Harness
 
-A unified Go-based abstraction layer for interacting with both local and cloud LLM models. Guido provides a consistent interface for seamlessly switching between different model providers.
+A unified Go-based harness for local and cloud LLM models. Run a single model from the command line, start a persistent OpenAI-compatible HTTP server, or use it as a library — all from one binary with embedded llama.cpp tooling.
 
-## ⚡ Quick Start (TLDR)
+---
 
-### Build
+## Quick Start
+
+### Build & Install
+
 ```bash
 cd lib/cli
-make build
+make build    # compile llama.cpp + build guido binary
+make install  # install to ~/bin/guido + copy config to ~/.guido/config/
 ```
 
-This builds both `guido-harness` (HTTP server) and `guido-cli` (command-line tool) with embedded llama.cpp tools.
+`make install` places the binary at `~/bin/guido` and writes a starter config to `~/.guido/config/config.yaml` (skipped if the file already exists).
 
 ### Configure
-Copy or edit `config.yaml`:
+
+Edit `~/.guido/config/config.yaml`:
+
 ```yaml
+server:
+  port: 8080
+
+models:
+  default: my-model   # which backend to use when -m is not specified
+
 backends:
-  llamacpp:
-    url: "embedded"  # Auto-starts embedded llama-server
-    model: "gpt-oss:120b"
-    model_path: "${HOME}/.cache/huggingface/hub/models--openai--gpt-oss-120b/gguf/model.gguf"
+  my-model:
+    type: llamacpp
+    url: "embedded"   # auto-starts embedded llama-server on first request
+    port: 8002
+    model: "gemma4"
+    model_path: "${HOME}/.cache/huggingface/hub/.../model.gguf"
+    idle_timeout_seconds: 300   # unload from VRAM after 5 min idle (0 = never)
+
   mock:
-    model: "test-model"  # For testing without models
+    model: "test-model"   # no model file needed, useful for testing
 ```
 
-### Run HTTP Server
+### Use It
+
 ```bash
-./bin/guido-harness -config config.yaml
-```
-
-Then make requests:
-```bash
-# Health check
-curl http://localhost:8080/health
-
-# List models
-curl http://localhost:8080/v1/models
-
-# Get completion
-curl -X POST http://localhost:8080/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"prompt":"Hello","model":"mock","max_tokens":50}'
-```
-
-### Run CLI
-```bash
-# List models
-./bin/guido-cli -c config.yaml models
-
-# Get completion
-./bin/guido-cli -c config.yaml complete "What is AI?" -m mock
+guido complete "Explain Go interfaces in one paragraph"
+guido chat
+guido serve          # OpenAI-compatible HTTP server on port 8080
 ```
 
 ---
 
-## Features
+## Commands
 
-- **Multi-backend support**: Local models (via llama.cpp), OpenAI, and Anthropic APIs
-- **Dual mode operation**: HTTP server mode or command-line interface
-- **Streaming support**: Stream tokens in real-time from any provider
-- **Configuration management**: YAML-based configuration with environment variable overrides
-- **Provider abstraction**: Clean, reusable interface for building tools on top
+### `complete` — one-shot prompt
+
+```bash
+guido complete "<prompt>" [flags]
+```
+
+Sends a single prompt and prints the response, then exits. Any embedded llama-server started for this invocation is stopped on exit.
+
+```bash
+# Use the default model
+guido complete "What is a transformer?"
+
+# Use a specific backend
+guido complete "Solve 3x + 7 = 22 step by step" -m my-reasoning-model
+
+# Attach files and images
+guido complete "Summarize this document" --file report.pdf
+guido complete "What's in this image?" --image screenshot.png
+guido complete "Explain this code" --file main.go --context "Focus on error handling"
+```
+
+**Flags**
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--model` | `-m` | config default | Backend to initialize and query |
+| `--temperature` | `-t` | `0.7` | Sampling temperature |
+| `--max-tokens` | `-n` | `-1` (unlimited) | Max tokens to generate |
+| `--context` | | | Raw string injected before the prompt |
+| `--file` | | | File to attach (text → inline, image → base64) |
+| `--image` | | | Image file to attach (base64-encoded) |
+| `--all-backends` | | `false` | Initialize every configured backend instead of just the target |
+
+---
+
+### `chat` — interactive session
+
+```bash
+guido chat [flags]
+```
+
+Starts a multi-turn conversation in your terminal. Full message history is maintained in memory and re-sent each request (llama-server's prompt cache speeds up repeated prefixes). Type `exit` or press Ctrl+C to quit.
+
+```bash
+# Default model, no system prompt
+guido chat
+
+# Specific model with a persona
+guido chat -m my-model --system "You are a concise technical assistant."
+
+# Attach context to the first message only
+guido chat --image diagram.png --file architecture.md
+
+# Enable web search tools
+guido chat --search
+```
+
+**Flags** — same as `complete`, plus:
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--system` | `-s` | | System prompt |
+| `--search` | | `false` | Give the model `web_search` and `fetch_url` tools |
+
+---
+
+### `serve` — OpenAI-compatible HTTP server
+
+```bash
+guido serve [flags]
+```
+
+Starts a persistent HTTP server. Embedded llama-server processes use **lazy loading** — they start on the first request and optionally unload after the configured idle timeout. The server itself starts instantly with no VRAM usage.
+
+```bash
+# Serve the default model
+guido serve
+
+# Serve a specific backend
+guido serve -m my-model
+
+# Serve all configured backends (multi-model server)
+guido serve --all-backends
+```
+
+**Flags**
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--model` | `-m` | config default | Backend to serve |
+| `--all-backends` | | `false` | Serve every configured backend |
+
+---
+
+### `models` — list available models
+
+```bash
+guido models
+```
+
+Queries all configured backends and prints their available models.
+
+---
+
+## HTTP API
+
+When running `guido serve`, the server exposes an OpenAI-compatible API on the configured port (default `8080`).
+
+### Endpoints
+
+#### `POST /v1/completions`
+```bash
+curl -X POST http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Hello", "model": "my-model", "max_tokens": 512, "stream": false}'
+```
+
+#### `POST /v1/chat/completions`
+```bash
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "my-model",
+    "messages": [{"role": "user", "content": "What is Go?"}],
+    "stream": true
+  }'
+```
+
+Multimodal messages use the OpenAI content-part format:
+```json
+{
+  "model": "my-vision-model",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/..."}},
+      {"type": "text", "text": "What is in this image?"}
+    ]
+  }]
+}
+```
+
+#### `GET /v1/models`
+```bash
+curl http://localhost:8080/v1/models
+```
+
+#### `GET /v1/model/status`
+Returns the load state of lazy backends (useful for showing a loading indicator in a GUI):
+```bash
+# All backends
+curl http://localhost:8080/v1/model/status
+
+# Specific backend
+curl "http://localhost:8080/v1/model/status?backend=my-model"
+```
+
+Response:
+```json
+{
+  "my-model": {"model": "gemma4", "status": "ready", "idle_seconds": 42}
+}
+```
+
+States: `unloaded` → `loading` → `ready` → `unloaded` (after idle timeout)
+
+#### `GET /health`
+```bash
+curl http://localhost:8080/health
+```
+
+---
+
+## Configuration Reference
+
+```yaml
+server:
+  port: 8080
+
+models:
+  default: my-model   # backend key used when no -m flag is given
+
+backends:
+
+  # ── Local model (embedded llama-server) ─────────────────────────────────
+  my-model:
+    type: llamacpp
+    url: "embedded"                    # guido manages the llama-server process
+    port: 8002                         # port for this model's llama-server
+    model: "gemma4"                    # model name reported to clients
+    model_path: "${HOME}/.../model.gguf"
+    mmproj_path: "${HOME}/.../mmproj.gguf"  # optional — required for vision models
+    idle_timeout_seconds: 300          # 0 = stay loaded until server stops
+    gpu_layers: 99                     # layers to offload to GPU
+
+  # ── External llama-server (you manage it) ────────────────────────────────
+  external:
+    type: llamacpp
+    url: "http://192.168.1.50:8000"
+    model: "my-remote-model"
+
+  # ── OpenAI ───────────────────────────────────────────────────────────────
+  openai:
+    api_key: "${OPENAI_API_KEY}"
+    model: "gpt-4o"
+
+  # ── Anthropic ────────────────────────────────────────────────────────────
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    model: "claude-3-5-sonnet-20241022"
+
+  # ── Mock (testing, no model file needed) ────────────────────────────────
+  mock:
+    model: "test-model"
+```
+
+Environment variables in `model_path`, `mmproj_path`, and `api_key` are expanded at startup.
+
+---
+
+## Lazy Loading & Idle Timeout
+
+Embedded llama-server backends use lazy loading in `serve` mode:
+
+- **Server starts instantly** — no VRAM used at startup
+- **Model loads on the first request** — clients see a ~6s delay while it warms up
+- **`/v1/model/status`** lets your UI show a loading indicator instead of timing out
+- **`idle_timeout_seconds`** — after this many seconds with no requests, the model unloads from VRAM automatically; the next request reloads it
+
+For `complete` and `chat` commands, loading is eager (loads immediately, cleans up on exit). This is intentional — those commands are short-lived and you want the response right away.
+
+---
+
+## Multimodal / Vision
+
+Vision models require a multimodal projector (mmproj) file alongside the main model:
+
+```yaml
+backends:
+  my-vision-model:
+    type: llamacpp
+    url: "embedded"
+    port: 8002
+    model: "gemma4"
+    model_path: "${HOME}/.../model-q4km.gguf"
+    mmproj_path: "${HOME}/.../model-mmproj.gguf"   # required for image input
+```
+
+Then from the CLI:
+```bash
+guido complete "Describe what you see" --image photo.jpg
+guido chat --image diagram.png
+```
+
+Or via the API using OpenAI-compatible `image_url` content parts (data URIs supported).
+
+---
 
 ## Architecture
 
 ```
 lib/cli/
-├── harness/              # Core abstraction layer
-│   ├── llm.go           # LLMProvider interface & routing logic
-│   ├── config.go        # Configuration loading & env expansion
-│   ├── models.go        # Type definitions
-│   └── errors.go        # Error types
+├── harness/               # Core abstraction
+│   ├── llm.go            # LLMProvider interface, Harness, SimpleRouter
+│   ├── config.go         # YAML loading with env expansion
+│   ├── models.go         # BackendConfig, ChatRequest/Response types
+│   ├── content.go        # MessageContent — text or multipart (text+image)
+│   └── errors.go         # Error types
 │
-├── backends/            # Provider implementations
-│   ├── llamacpp.go      # llama.cpp HTTP adapter
-│   ├── openai.go        # OpenAI API adapter
-│   ├── anthropic.go     # Anthropic API adapter
-│   ├── mock.go          # Mock backend for testing
-│   └── huggingface.go   # HuggingFace transformers adapter
+├── backends/              # Provider implementations
+│   ├── llamacpp.go       # llama.cpp HTTP adapter
+│   ├── lazy_llamacpp.go  # Lazy-loading wrapper with idle-timeout unloading
+│   ├── openai.go         # OpenAI API adapter
+│   ├── anthropic.go      # Anthropic API adapter
+│   ├── mock.go           # In-memory mock for testing
+│   └── huggingface.go    # HuggingFace transformers adapter
 │
-├── tools/               # Tool management
-│   └── manager.go       # Lifecycle management for llama-server
+├── httpserver/            # HTTP server layer
+│   ├── serve.go          # Route registration
+│   └── handler.go        # Request handlers (completions, chat, models, status)
+│
+├── tools/                 # llama-server lifecycle
+│   └── manager.go        # Start/stop llama-server, web tool execution
 │
 ├── cmd/
-│   ├── harness/         # HTTP server entry point
-│   │   ├── main.go
-│   │   └── handler.go   # HTTP request handlers
-│   │
-│   └── cli/             # CLI entry point
-│       └── main.go
+│   ├── cli/main.go       # guido CLI (complete, chat, serve, models)
+│   └── harness/main.go   # guido-harness (HTTP-only server)
 │
-├── scripts/             # Build scripts
-│   ├── build-llama.sh   # Compile llama.cpp from submodule
-│   └── create-py-wrappers.sh  # Create Python wrapper executables
+├── bin/                   # Built outputs
+│   ├── guido             # Main binary (after make install)
+│   └── llama-cpp-tools/  # Embedded llama.cpp tools
 │
-├── bin/                 # Compiled binaries & embedded tools
-│   ├── guido-harness    # HTTP server with embedded llama-server
-│   ├── guido-cli        # CLI tool
-│   └── llama-cpp-tools/ # Embedded llama.cpp tools
-│       ├── llama-server
-│       ├── llama-cli
-│       ├── llama-quantize
-│       ├── llama-bench
-│       └── ... (other tools)
-│
-├── Makefile             # Build orchestration
-├── config.yaml          # Sample configuration
-├── go.mod               # Go module definition
-└── go.sum               # Dependency checksums
+├── Makefile
+└── config.yaml            # Sample configuration
 ```
 
-## Installation
-
-### Build from source
-
-```bash
-cd lib/cli
-make build
-```
-
-This compiles llama.cpp tools and builds both the HTTP server and CLI with embedded tools. Binaries are placed in `bin/guido-{harness,cli}`.
-
-## Configuration
-
-Create a `config.yaml` file (or use the template):
-
-```yaml
-server:
-  port: 8080
-  mode: http
-
-models:
-  default: openai
-
-backends:
-  openai:
-    api_key: "${OPENAI_API_KEY}"
-    model: "gpt-4"
-
-  anthropic:
-    api_key: "${ANTHROPIC_API_KEY}"
-    model: "claude-3-sonnet-20240229"
-
-  llamacpp:
-    url: "http://localhost:8000"
-    model: "llama-2"
-```
-
-### Environment Variables
-
-- `OPENAI_API_KEY` - OpenAI API key
-- `ANTHROPIC_API_KEY` - Anthropic API key
-- `LLAMACPP_URL` - URL to llama.cpp HTTP server
-
-## Usage
-
-### Server Mode (HTTP API)
-
-Start the HTTP server:
-
-```bash
-cd lib/cli
-./bin/guido-harness -config config.yaml
-```
-
-The server exposes these endpoints:
-
-#### POST /v1/completions
-Submit a completion request:
-
-```bash
-curl -X POST http://localhost:8080/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "What is Go?",
-    "model": "openai",
-    "max_tokens": 256,
-    "temperature": 0.7,
-    "stream": false
-  }'
-```
-
-#### GET /v1/models
-List available models:
-
-```bash
-curl http://localhost:8080/v1/models
-```
-
-#### GET /health
-Health check:
-
-```bash
-curl http://localhost:8080/health
-```
-
-### CLI Mode
-
-Get a single completion:
-
-```bash
-cd lib/cli
-./bin/guido-cli complete "What is Go?" -m openai -n 256 -t 0.7
-```
-
-Available options:
-- `-m, --model` - Model to use (default from config)
-- `-t, --temperature` - Sampling temperature (default: 0.7)
-- `-n, --max-tokens` - Maximum tokens to generate (default: 256)
-- `-c, --config` - Path to config file (default: config.yaml)
-
-List available models:
-
-```bash
-./bin/guido-cli models
-```
-
-Interactive chat (placeholder):
-
-```bash
-./bin/guido-cli chat
-```
-
-## Setting up Local Models with llama.cpp
-
-llama.cpp tools are embedded in the Guido binary. No separate installation needed!
-
-**Option 1: Embedded llama-server (Recommended)**
-
-Set `url: "embedded"` in your config:
-```yaml
-backends:
-  llamacpp:
-    url: "embedded"              # Auto-starts on harness startup
-    model: "gpt-oss:120b"
-    model_path: "/path/to/model.gguf"
-```
-
-The harness will automatically start llama-server with your model. Environment variables like `${HOME}` are expanded.
-
-**Option 2: External llama-server**
-
-If you prefer to manage the server separately:
-```bash
-# Point to external server
-# From a different terminal:
-./lib/cli/bin/llama-cpp-tools/llama-server -m /path/to/model.gguf --port 8001
-```
-
-Then in config:
-```yaml
-backends:
-  llamacpp:
-    url: "http://localhost:8001"
-    model: "gpt-oss:120b"
-```
+---
 
 ## Using as a Library
 
-Import the harness in your own Go project:
-
 ```go
-package main
-
 import (
-	"context"
-	"log"
-
-	"guido/lib/cli/backends"
-	"guido/lib/cli/harness"
+    "guido/lib/cli/backends"
+    "guido/lib/cli/harness"
 )
 
-func main() {
-	// Load config
-	cfg, err := harness.LoadConfig("config.yaml")
-	if err != nil {
-		log.Fatal(err)
-	}
+cfg, _ := harness.LoadConfig("~/.guido/config/config.yaml")
+h := harness.NewHarness(cfg)
 
-	// Create harness
-	h := harness.NewHarness(cfg)
+provider := backends.NewOpenAIBackend(os.Getenv("OPENAI_API_KEY"), "gpt-4o")
+h.RegisterProvider("openai", provider)
+h.SetRouter(harness.NewSimpleRouter(cfg, map[string]harness.LLMProvider{"openai": provider}))
 
-	// Register providers
-	openaiProvider := backends.NewOpenAIBackend("your-api-key", "gpt-4")
-	h.RegisterProvider("openai", openaiProvider)
-
-	// Set up router
-	providers := map[string]harness.LLMProvider{
-		"openai": openaiProvider,
-	}
-	router := harness.NewSimpleRouter(cfg, providers)
-	h.SetRouter(router)
-
-	// Use the harness
-	req := &harness.CompletionRequest{
-		Prompt:      "What is Go?",
-		Model:       "openai",
-		MaxTokens:   256,
-		Temperature: 0.7,
-	}
-
-	ctx := context.Background()
-	resp, err := h.Complete(ctx, req)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	log.Println(resp.Text)
+ch, _ := h.StreamChat(ctx, &harness.ChatRequest{
+    Messages: []harness.ChatMessage{
+        {Role: "user", Content: harness.Text("Hello!")},
+    },
+    Model: "openai",
+})
+for token := range ch {
+    fmt.Print(token)
 }
 ```
 
-## Extending with New Backends
+---
 
-To add support for a new provider, implement the `LLMProvider` interface:
+## Building a New Backend
 
-```go
-type MyBackend struct {
-	// Your backend state
-}
-
-func (mb *MyBackend) Complete(ctx context.Context, req *harness.CompletionRequest) (*harness.CompletionResponse, error) {
-	// Implement completion logic
-}
-
-func (mb *MyBackend) StreamTokens(ctx context.Context, req *harness.CompletionRequest) (<-chan string, error) {
-	// Implement streaming logic
-}
-
-func (mb *MyBackend) ListModels(ctx context.Context) ([]harness.ModelInfo, error) {
-	// Implement model listing
-}
-```
-
-Then register it:
-
-```go
-h.RegisterProvider("mybackend", myBackendInstance)
-```
-
-## API Reference
-
-### LLMProvider Interface
+Implement the `LLMProvider` interface:
 
 ```go
 type LLMProvider interface {
     Complete(ctx context.Context, req *CompletionRequest) (*CompletionResponse, error)
     StreamTokens(ctx context.Context, req *CompletionRequest) (<-chan string, error)
+    Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error)
+    StreamChat(ctx context.Context, req *ChatRequest) (<-chan string, error)
     ListModels(ctx context.Context) ([]ModelInfo, error)
 }
 ```
 
-### CompletionRequest
+Register it in `initializeBackends` in `cmd/cli/main.go` and add a config entry.
 
-```go
-type CompletionRequest struct {
-    Prompt      string  // The prompt text
-    Temperature float32 // Sampling temperature (0-2)
-    MaxTokens   int     // Maximum tokens to generate
-    StreamMode  bool    // Whether to stream tokens
-    Model       string  // Which model to use
-}
-```
-
-### CompletionResponse
-
-```go
-type CompletionResponse struct {
-    Text         string // Generated text
-    FinishReason string // "stop", "length", or "error"
-    TokensUsed   int    // Number of tokens used
-    Model        string // Model that generated response
-}
-```
-
-## Testing
-
-### Manual Testing
-
-Start the server:
-```bash
-cd lib/cli
-./bin/guido-harness -config config.yaml
-```
-
-In another terminal:
-```bash
-curl -X POST http://localhost:8080/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "Hello", "model": "openai"}'
-```
-
-### Unit Tests
-
-```bash
-cd lib/cli
-go test ./...
-```
+---
 
 ## Troubleshooting
 
-### No backends configured
-Ensure at least one backend is configured in `config.yaml` with the required API keys set via environment variables.
+**Model doesn't load / no output**
+- Check `guido serve` logs — llama-server stderr is forwarded
+- For vision models, confirm `mmproj_path` points to a valid mmproj file
+- Run `curl http://localhost:<port>/health` to check the embedded server directly
 
-### Connection refused (llama.cpp)
-Verify llama.cpp server is running on the configured URL:
+**Port conflict**
+```
+a llama-server is already running on port 8002 but serves a different model
+```
+Kill the old process and retry:
 ```bash
-curl http://localhost:8000/health
+pkill -f 'llama-server.*8002'
 ```
 
-### API errors
-Check that your API keys are correctly set in environment variables:
+**Config not found**
 ```bash
-echo $OPENAI_API_KEY
-echo $ANTHROPIC_API_KEY
+guido --config /path/to/config.yaml complete "hello"
 ```
+Default config path: `~/.guido/config/config.yaml`
 
-### Build errors after moving files
-Make sure all import paths have been updated to use `guido/lib/cli/` instead of `guido/lib/`:
-- `guido/lib/cli/harness`
-- `guido/lib/cli/backends`
-
-Run `go mod tidy` to clean up dependencies:
+**Build errors**
 ```bash
 cd lib/cli
 go mod tidy
+make build
 ```
-
-## Future Enhancements
-
-- [ ] Batch request support
-- [ ] Token counting utilities
-- [ ] Cost tracking
-- [ ] Request caching
-- [ ] Rate limiting
-- [ ] Structured output support (JSON schema)
-- [ ] Tool/function calling interface
-- [ ] Vision/multimodal support
-- [ ] Interactive chat mode with history
-- [ ] Provider-specific optimization
-
-## License
-
-See LICENSE file in project root
-
-## Contributing
-
-Contributions welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
-
-## Support
-
-For issues, questions, or suggestions, please open an issue on GitHub.

@@ -3,7 +3,7 @@ server:
   mode: http              # 'http' for service, 'cli' for command-line
 
 models:
-  default: gemma4-q4km       # Default provider name to use if not specified in request
+  default: gemma4-reasoning
 
 backends:
   # ─────────────────────────────────────────────────────────────────────
@@ -14,15 +14,23 @@ backends:
   # The key name alone is enough for a single backend (backward compat).
   # ─────────────────────────────────────────────────────────────────────
 
-  # Single local model — classic style, key name = type
-  gemma4-q4km:
+  gemma4-reasoning:
     type: llamacpp
     url: "embedded"
-    port: 8002
-    model: "gemma4:31b-q4km"
-    model_path: "${HOME}/.cache/huggingface/hub/models--google--gemma-4-31B/gguf/model-q4km.gguf"
-    mmproj_path: "${HOME}/.cache/huggingface/hub/models--google--gemma-4-31B/gguf/model-f16-mmproj.gguf"
-    idle_timeout_seconds: 60  # Unload from VRAM after N seconds idle (0 = keep loaded forever)
+    port: 8003
+    model: "gemma4"
+    model_path: "${HOME}/.cache/huggingface/hub/models/google/gemma4-31b/gguf/gemma4:31b-q4km-reasoning.gguf"
+    # mmproj_path:
+    idle_timeout_seconds: 60
+
+  gpt-oss:
+    type: llamacpp
+    url: "embedded"
+    port: 8003
+    model: "gemma4"
+    model_path: "${HOME}/.cache/huggingface/hub/models/openai/gguf/gpt-oss:20b-f16.gguf"
+    # mmproj_path:
+    idle_timeout_seconds: 60
 
   # Multiple local models — use explicit "type: llamacpp" + unique key names
   # Each gets its own llama-server on a separate port (auto-assigned or explicit).
