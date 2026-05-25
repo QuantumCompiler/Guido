@@ -1,0 +1,8 @@
+#!/bin/bash
+# Auto-generated wrapper for llama.cpp Python script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Wrapper lives at exec/bin/llama-cpp-tools/ — three levels up then into modules/
+LLAMA_DIR="$(cd "$SCRIPT_DIR/../../../modules/llama.cpp" && pwd)"
+SCRIPT_NAME="convert_hf_to_gguf_update.py"
+
+exec python3 "$LLAMA_DIR/$SCRIPT_NAME" "$@"

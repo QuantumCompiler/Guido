@@ -116,6 +116,8 @@ guido chat --search
 | `--system` | `-s` | | System prompt |
 | `--search` | | `false` | Give the model `web_search` and `fetch_url` tools |
 
+MCP tools from servers listed under `mcp_servers:` in your config are always available in `chat` — no extra flag required. See [MCP Tools](#mcp-tools) below.
+
 ---
 
 ### `serve` — OpenAI-compatible HTTP server
@@ -266,9 +268,29 @@ backends:
   # ── Mock (testing, no model file needed) ────────────────────────────────
   mock:
     model: "test-model"
+
+# ── MCP servers (optional) ──────────────────────────────────────────────────
+# Connect to Model Context Protocol servers and make their tools available
+# in the chat agentic loop. Tools appear as mcp__<name>__<tool>.
+mcp_servers:
+  - name: filesystem
+    enabled: true
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "${HOME}/Documents"]
+
+  - name: git
+    enabled: true
+    command: uvx
+    args: ["mcp-server-git", "--repository", "."]
+
+  - name: postgres
+    enabled: false                # set to true to activate
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-postgres"]
+    env: ["DATABASE_URL=${DATABASE_URL}"]
 ```
 
-Environment variables in `model_path`, `mmproj_path`, and `api_key` are expanded at startup.
+Environment variables in `model_path`, `mmproj_path`, `api_key`, and MCP `args`/`env` entries are expanded at startup.
 
 ---
 
@@ -310,43 +332,83 @@ Or via the API using OpenAI-compatible `image_url` content parts (data URIs supp
 
 ---
 
+## MCP Tools
+
+Guido can connect to [Model Context Protocol](https://modelcontextprotocol.io) servers and expose their tools to the model in the `chat` agentic loop. Any server runnable via `npx`, `uvx`, or a direct executable is supported (stdio transport).
+
+### Setup
+
+Add an `mcp_servers` section to `~/.guido/config/config.yaml`:
+
+```yaml
+mcp_servers:
+  - name: filesystem
+    enabled: true
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "${HOME}/Documents"]
+```
+
+Then run `guido chat` — no extra flag needed. Configured servers connect at startup and their tools are automatically included in every request.
+
+### Tool naming
+
+Tools appear as `mcp__<server-name>__<tool-name>`. For example:
+
+| MCP server | Tool name | As seen by the model |
+|---|---|---|
+| `filesystem` | `read_file` | `mcp__filesystem__read_file` |
+| `git` | `git_log` | `mcp__git__git_log` |
+| `postgres` | `query` | `mcp__postgres__query` |
+
+### Built-in tools alongside MCP
+
+`--search` and MCP tools are independent and compose freely:
+
+```bash
+guido chat --search   # web_search + fetch_url + all MCP tools
+guido chat            # MCP tools only (if mcp_servers configured)
+```
+
+### Failed connections
+
+Servers that fail to connect (missing `npx`, wrong args, etc.) are logged and skipped. Guido starts normally with whichever servers did connect.
+
+---
+
 ## Architecture
 
 ```
 lib/cli/
-├── harness/               # Core abstraction
-│   ├── llm.go            # LLMProvider interface, Harness, SimpleRouter
-│   ├── config.go         # YAML loading with env expansion
-│   ├── models.go         # BackendConfig, ChatRequest/Response types
-│   ├── content.go        # MessageContent — text or multipart (text+image)
-│   └── errors.go         # Error types
-│
-├── backends/              # Provider implementations
-│   ├── llamacpp.go       # llama.cpp HTTP adapter
-│   ├── lazy_llamacpp.go  # Lazy-loading wrapper with idle-timeout unloading
-│   ├── openai.go         # OpenAI API adapter
-│   ├── anthropic.go      # Anthropic API adapter
-│   ├── mock.go           # In-memory mock for testing
-│   └── huggingface.go    # HuggingFace transformers adapter
-│
-├── httpserver/            # HTTP server layer
-│   ├── serve.go          # Route registration
-│   └── handler.go        # Request handlers (completions, chat, models, status)
-│
-├── tools/                 # llama-server lifecycle
-│   └── manager.go        # Start/stop llama-server, web tool execution
-│
-├── cmd/
-│   ├── cli/main.go       # guido CLI (complete, chat, serve, models)
-│   └── harness/main.go   # guido-harness (HTTP-only server)
-│
-├── bin/                   # Built outputs
-│   ├── guido             # Main binary (after make install)
-│   └── llama-cpp-tools/  # Embedded llama.cpp tools
-│
 ├── Makefile
-└── config.yaml            # Sample configuration
+├── README.md
+├── DEVELOPER.md           # Package-by-package developer reference
+├── config.yaml            # Sample configuration (copied to ~/.guido/config/ on install)
+├── go.mod / go.sum
+│
+├── src/                   # All Go source code
+│   ├── harness/           # Core interfaces, types, and config
+│   ├── backends/          # LLM provider implementations (llamacpp, openai, anthropic, …)
+│   ├── httpserver/        # HTTP route registration and handlers
+│   ├── tools/             # llama-server lifecycle and built-in tool calling
+│   ├── mcp/               # MCP client (connects to external MCP servers)
+│   └── cmd/
+│       ├── cli/main.go    # guido CLI (complete, chat, serve, models)
+│       └── harness/main.go # guido-harness (HTTP-only server)
+│
+├── exec/                  # Runtime artifacts
+│   ├── bin/               # Compiled binaries and embedded llama.cpp tools
+│   │   ├── guido          # Main binary (after make build)
+│   │   ├── guido-harness  # HTTP-only server binary
+│   │   └── llama-cpp-tools/
+│   └── scripts/           # Build scripts
+│       ├── build-llama.sh
+│       └── create-py-wrappers.sh
+│
+└── modules/               # Git submodules
+    └── llama.cpp/         # llama.cpp source (compiled separately)
 ```
+
+For a detailed description of every file, see [DEVELOPER.md](DEVELOPER.md).
 
 ---
 
@@ -354,8 +416,8 @@ lib/cli/
 
 ```go
 import (
-    "guido/lib/cli/backends"
-    "guido/lib/cli/harness"
+    "guido/lib/cli/src/backends"
+    "guido/lib/cli/src/harness"
 )
 
 cfg, _ := harness.LoadConfig("~/.guido/config/config.yaml")
