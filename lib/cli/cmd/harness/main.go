@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"guido/lib/cli/backends"
 	"guido/lib/cli/harness"
@@ -17,8 +18,13 @@ func main() {
 	// ── Flags ─────────────────────────────────────────────────────────────────
 	// Keep the flag package so existing scripts using -config / -llama-port
 	// keep working.
+	defaultConfig := "config.yaml"
+	if home, err := os.UserHomeDir(); err == nil {
+		defaultConfig = filepath.Join(home, ".guido", "config", "config.yaml")
+	}
+
 	var (
-		configPath = "config.yaml"
+		configPath = defaultConfig
 		llamaPort  = 8000
 		llamaGPU   = 99
 	)
@@ -121,10 +127,18 @@ func main() {
 					gpuLayers = llamaGPU
 				}
 				modelPath := os.ExpandEnv(bcfg.ModelPath)
-				if _, err := toolMgr.StartLlamaServer(modelPath, port, gpuLayers, bcfg.ChatTemplate); err != nil {
-					log.Fatalf("Failed to start llama-server for %q: %v", name, err)
-				}
 				llamacppURL = fmt.Sprintf("http://localhost:%d", port)
+				idleTimeout := time.Duration(bcfg.IdleTimeoutSeconds) * time.Second
+
+				// Use a lazy backend so the llama-server only starts on the
+				// first request and can unload after idle_timeout_minutes.
+				lb := backends.NewLazyLlamaCppBackend(
+					toolMgr, modelPath, llamacppURL, model,
+					bcfg.ChatTemplate, port, gpuLayers, idleTimeout,
+				)
+				providers[name] = lb
+				h.RegisterProvider(name, lb)
+				continue // skip NewLlamaCppBackend + end-of-loop registration below
 			}
 			providers[name] = backends.NewLlamaCppBackend(llamacppURL, model)
 
@@ -156,6 +170,8 @@ func main() {
 	}
 
 	h.SetRouter(harness.NewSimpleRouter(cfg, providers))
+
+	log.Printf("[guido] serve mode — models load on first request")
 
 	// ── HTTP server ───────────────────────────────────────────────────────────
 	if err := httpserver.Serve(context.Background(), cfg, h, func() {

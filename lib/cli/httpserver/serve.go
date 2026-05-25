@@ -29,6 +29,7 @@ func Serve(ctx context.Context, cfg *harness.Config, h *harness.Harness, onShutd
 	r.Post("/v1/completions", hnd.HandleCompletion)
 	r.Post("/v1/chat/completions", hnd.HandleChat)
 	r.Get("/v1/models", hnd.HandleListModels)
+	r.Get("/v1/model/status", hnd.HandleModelStatus)
 	r.Get("/health", hnd.HandleHealth)
 
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)

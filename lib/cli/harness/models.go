@@ -105,13 +105,33 @@ type ModelsConfig struct {
 
 // BackendConfig represents configuration for a specific backend
 type BackendConfig struct {
-	Type         string                 `yaml:"type" json:"type"`                   // "llamacpp", "openai", "anthropic", "mock", "huggingface"
-	APIKey       string                 `yaml:"api_key" json:"api_key"`
-	URL          string                 `yaml:"url" json:"url"`
-	Model        string                 `yaml:"model" json:"model"`
-	ModelPath    string                 `yaml:"model_path" json:"model_path"`       // Path to local model file for embedded servers
-	Port         int                    `yaml:"port" json:"port"`                   // Port for embedded servers (default auto-assigned)
-	ChatTemplate string                 `yaml:"chat_template" json:"chat_template"` // e.g. "gemma", "llama3", "chatml", "mistral"
-	GPULayers    int                    `yaml:"gpu_layers" json:"gpu_layers"`       // Override GPU layers (default 99)
-	Extra        map[string]interface{} `yaml:"-" json:"-"`
+	Type               string                 `yaml:"type" json:"type"`                             // "llamacpp", "openai", "anthropic", "mock", "huggingface"
+	APIKey             string                 `yaml:"api_key" json:"api_key"`
+	URL                string                 `yaml:"url" json:"url"`
+	Model              string                 `yaml:"model" json:"model"`
+	ModelPath          string                 `yaml:"model_path" json:"model_path"`                 // Path to local model file for embedded servers
+	Port               int                    `yaml:"port" json:"port"`                             // Port for embedded servers (default auto-assigned)
+	ChatTemplate       string                 `yaml:"chat_template" json:"chat_template"`           // e.g. "gemma", "llama3", "chatml", "mistral"
+	GPULayers          int                    `yaml:"gpu_layers" json:"gpu_layers"`                 // Override GPU layers (default 99)
+	IdleTimeoutSeconds int                    `yaml:"idle_timeout_seconds" json:"idle_timeout_seconds"` // Unload after N seconds idle (0 = never)
+	Extra              map[string]interface{} `yaml:"-" json:"-"`
+}
+
+// ─── Model status (for lazy-loaded backends) ──────────────────────────────────
+
+// ModelStatusState is the loading state of a backend.
+type ModelStatusState string
+
+const (
+	ModelStatusUnloaded ModelStatusState = "unloaded"
+	ModelStatusLoading  ModelStatusState = "loading"
+	ModelStatusReady    ModelStatusState = "ready"
+	ModelStatusError    ModelStatusState = "error"
+)
+
+// ModelStatusInfo is the payload returned by the /v1/model/status endpoint.
+type ModelStatusInfo struct {
+	Model       string           `json:"model"`
+	Status      ModelStatusState `json:"status"`
+	IdleSeconds int64            `json:"idle_seconds,omitempty"` // seconds since last request; 0 when not ready
 }

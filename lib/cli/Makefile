@@ -27,6 +27,7 @@ endif
 
 VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo "v0.1.0")
 BIN_DIR := bin
+CONFIG_DIR := $(HOME)/.guido/config
 LLAMA_BUILD_DIR := llama.cpp/build
 LLAMA_TOOLS_DIR := $(BIN_DIR)/llama-cpp-tools
 
@@ -40,7 +41,7 @@ help:
 	@echo "  build-llama     Build only llama.cpp tools"
 	@echo "  build-go        Build only Go binaries (requires build-llama first)"
 	@echo "  clean           Clean build artifacts"
-	@echo "  install         Build and install binaries to ./bin"
+	@echo "  install         Build, install binaries to ./bin, copy config to ~/.guido/config"
 	@echo "  test            Run tests"
 	@echo ""
 	@echo "Build info: $(OS)-$(ARCH) v$(VERSION)"
@@ -62,17 +63,25 @@ build-go:
 	@cd . && go build -o bin/guido-cli ./cmd/cli
 	@echo "✓ Go binaries built: bin/guido-{harness,cli}"
 
-# Install binaries (just reports where they are)
+# Install binaries and deploy config to ~/.guido/config
 install: build
+	@echo "Installing config..."
+	@mkdir -p "$(CONFIG_DIR)"
+	@if [ -f "$(CONFIG_DIR)/config.yaml" ]; then \
+		echo "  config already exists at $(CONFIG_DIR)/config.yaml — skipping (delete it to reset)"; \
+	else \
+		cp config.yaml "$(CONFIG_DIR)/config.yaml"; \
+		echo "  ✓ config copied to $(CONFIG_DIR)/config.yaml"; \
+	fi
 	@echo ""
 	@echo "✓ Installation complete!"
 	@echo ""
-	@echo "Binaries available at:"
-	@ls -lh bin/guido-harness bin/guido-cli 2>/dev/null || echo "  (run 'make build' first)"
+	@echo "Binaries: bin/guido-{harness,cli}"
+	@echo "Config:   $(CONFIG_DIR)/config.yaml"
 	@echo ""
 	@echo "To use:"
-	@echo "  ./bin/guido-harness -config config.yaml"
-	@echo "  ./bin/guido-cli complete \"Your prompt\""
+	@echo "  ./bin/guido-cli serve"
+	@echo "  ./bin/guido-cli chat"
 
 # Clean build artifacts
 clean:

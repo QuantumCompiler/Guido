@@ -4,6 +4,12 @@ import (
 	"context"
 )
 
+// StatusReporter is an optional interface that LLMProvider implementations
+// can satisfy to expose their loading/idle state to the HTTP layer.
+type StatusReporter interface {
+	ModelStatus() ModelStatusInfo
+}
+
 // LLMProvider is the interface that all model backends must implement
 type LLMProvider interface {
 	// Complete sends a single-turn completion request and returns a response
@@ -98,6 +104,31 @@ func (h *Harness) StreamChat(ctx context.Context, req *ChatRequest) (<-chan stri
 	}
 
 	return provider.StreamChat(ctx, req)
+}
+
+// ModelStatus returns the status of a named backend if it implements StatusReporter.
+// The second return value is false when the backend doesn't exist or doesn't report status.
+func (h *Harness) ModelStatus(backendName string) (ModelStatusInfo, bool) {
+	p, ok := h.providers[backendName]
+	if !ok {
+		return ModelStatusInfo{}, false
+	}
+	sr, ok := p.(StatusReporter)
+	if !ok {
+		return ModelStatusInfo{}, false
+	}
+	return sr.ModelStatus(), true
+}
+
+// AllModelStatuses returns status for every backend that implements StatusReporter.
+func (h *Harness) AllModelStatuses() map[string]ModelStatusInfo {
+	result := make(map[string]ModelStatusInfo)
+	for name, p := range h.providers {
+		if sr, ok := p.(StatusReporter); ok {
+			result[name] = sr.ModelStatus()
+		}
+	}
+	return result
 }
 
 // ListAllModels returns all available models from all providers

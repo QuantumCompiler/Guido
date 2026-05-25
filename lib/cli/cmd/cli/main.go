@@ -81,8 +81,8 @@ var completeCmd = &cobra.Command{
 		// Initialize harness
 		h := harness.NewHarness(cfg)
 
-		// Register backends (pass tool manager for embedded llama-server support)
-		providers := initializeBackends(h, cfg, toolMgr)
+		// Register backends (eager — complete command exits after one response)
+		providers := initializeBackends(h, cfg, toolMgr, false)
 
 		if len(providers) == 0 {
 			log.Fatal("No backends configured")
@@ -138,7 +138,7 @@ var chatCmd = &cobra.Command{
 
 		// Initialize harness
 		h := harness.NewHarness(cfg)
-		providers := initializeBackends(h, cfg, toolMgr)
+		providers := initializeBackends(h, cfg, toolMgr, false)
 		if len(providers) == 0 {
 			log.Fatal("No backends configured")
 		}
@@ -172,7 +172,7 @@ var chatCmd = &cobra.Command{
 			os.Exit(0)
 		}()
 
-		fmt.Printf("Chat with %s  (type 'exit' to quit, Ctrl+C to interrupt)\n", chatModel)
+		fmt.Printf("Guido (%s)  — type 'exit' to quit, Ctrl+C to interrupt\n", chatModel)
 		if systemPrompt != "" {
 			fmt.Printf("System: %s\n", systemPrompt)
 		}
@@ -226,7 +226,7 @@ var chatCmd = &cobra.Command{
 					if len(resp.Message.ToolCalls) == 0 {
 						// Final answer — print and break.
 						text := strings.TrimSpace(stripStopTokens(resp.Message.Content))
-						fmt.Printf("\nAssistant: %s\n", text)
+						fmt.Printf("\nGuido: %s\n", text)
 						replied = true
 						break
 					}
@@ -273,7 +273,7 @@ var chatCmd = &cobra.Command{
 					Stream:      true,
 				}
 
-				fmt.Print("\nAssistant: ")
+				fmt.Print("\nGuido: ")
 
 				tokenChan, err := h.StreamChat(ctx, req)
 				if err != nil {
@@ -326,11 +326,15 @@ will be terminated automatically.`,
 		}
 
 		h := harness.NewHarness(cfg)
-		providers := initializeBackends(h, cfg, toolMgr)
+		// Lazy mode: embedded llamacpp backends start on the first request.
+		// idle_timeout_minutes in config controls automatic VRAM unloading.
+		providers := initializeBackends(h, cfg, toolMgr, true)
 		if len(providers) == 0 {
 			log.Fatal("No backends configured")
 		}
 		h.SetRouter(harness.NewSimpleRouter(cfg, providers))
+
+		log.Printf("[guido] serve mode — models load on first request")
 
 		if err := httpserver.Serve(context.Background(), cfg, h, func() {
 			if err := toolMgr.Close(); err != nil {
@@ -356,7 +360,7 @@ var modelsCmd = &cobra.Command{
 		h := harness.NewHarness(cfg)
 
 		// Register backends
-		providers := initializeBackends(h, cfg, toolMgr)
+		providers := initializeBackends(h, cfg, toolMgr, false)
 
 		if len(providers) == 0 {
 			fmt.Println("No backends configured")
@@ -404,7 +408,15 @@ func nextEmbeddedPort(used map[int]bool, basePort int) int {
 	return p
 }
 
-func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manager) map[string]harness.LLMProvider {
+// initializeBackends registers all configured backends with the harness.
+//
+// When lazy is true (serve mode), embedded llamacpp backends are wrapped in a
+// LazyLlamaCppBackend so the llama-server process only starts on the first
+// request and can optionally unload after an idle timeout.
+//
+// When lazy is false (complete / chat / models commands), the server is started
+// eagerly so the command can run immediately and be cleaned up on exit.
+func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manager, lazy bool) map[string]harness.LLMProvider {
 	providers := make(map[string]harness.LLMProvider)
 	usedPorts := make(map[int]bool)
 
@@ -445,37 +457,49 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 
 			llamacppURL := bcfg.URL
 			if bcfg.URL == "embedded" || bcfg.URL == "" {
-				// Determine which port this instance should use.
-				// Config can specify an explicit port; otherwise auto-assign from 8000 up.
 				port := bcfg.Port
 				if port == 0 {
 					port = nextEmbeddedPort(usedPorts, 8000)
 				}
 				usedPorts[port] = true
 				llamacppURL = fmt.Sprintf("http://localhost:%d", port)
-
 				expandedModelPath := os.ExpandEnv(bcfg.ModelPath)
 
+				if lazy {
+					// ── Lazy path (serve mode) ────────────────────────────────
+					// The LazyLlamaCppBackend manages the llama-server lifecycle
+					// internally: it starts on the first request and optionally
+					// unloads after idleTimeout minutes of inactivity.
+					gpuLayers := bcfg.GPULayers
+					if gpuLayers == 0 {
+						gpuLayers = 99
+					}
+					idleTimeout := time.Duration(bcfg.IdleTimeoutSeconds) * time.Second
+					lb := backends.NewLazyLlamaCppBackend(
+						tm, expandedModelPath, llamacppURL, modelName,
+						bcfg.ChatTemplate, port, gpuLayers, idleTimeout,
+					)
+					providers[name] = lb
+					h.RegisterProvider(name, lb)
+					continue // skip the eager startup + NewLlamaCppBackend below
+				}
+
+				// ── Eager path (complete / chat / models commands) ────────────
 				// Check if a server is already running on this port.
 				status := llamaServerStatus(llamacppURL, expandedModelPath)
-
 				if status == serverLoading {
-					// Server is up but model still loading — wait for it (up to 5 minutes).
 					log.Printf("Waiting for llama-server on %s to finish loading...", llamacppURL)
 					status = waitForServer(llamacppURL, expandedModelPath, 5*time.Minute)
 				}
-
 				switch status {
 				case serverReady:
 					log.Printf("Using existing llama-server for %q at %s", name, llamacppURL)
-
 				case serverWrongModel:
 					log.Fatalf(
 						"A llama-server is already running on %s but serves a different model.\n"+
 							"Kill it first, then retry:\n\n  pkill -f 'llama-server.*%d'\n",
 						llamacppURL, port,
 					)
-
 				case serverNotRunning, serverLoading:
 					if tm != nil && expandedModelPath != "" {
 						gpuLayers := bcfg.GPULayers
@@ -517,8 +541,18 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 	return providers
 }
 
+// defaultConfigPath returns ~/.guido/config/config.yaml, falling back to
+// "config.yaml" in the current directory if the home dir can't be determined.
+func defaultConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "config.yaml"
+	}
+	return filepath.Join(home, ".guido", "config", "config.yaml")
+}
+
 func init() {
-	rootCmd.PersistentFlags().StringVar(&configPath, "config", "config.yaml", "Path to config file")
+	rootCmd.PersistentFlags().StringVar(&configPath, "config", defaultConfigPath(), "Path to config file")
 
 	completeCmd.Flags().StringVarP(&model, "model", "m", "", "Model to use (default from config)")
 	completeCmd.Flags().Float32VarP(&temperature, "temperature", "t", 0.7, "Temperature for sampling")

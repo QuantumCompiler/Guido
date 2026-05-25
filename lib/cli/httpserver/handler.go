@@ -177,3 +177,35 @@ func (hnd *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
+
+// HandleModelStatus handles GET /v1/model/status
+//
+// Without query params: returns status for all lazy-loading backends.
+// With ?backend=<name>: returns status for that specific backend only.
+//
+// Example responses:
+//
+//	GET /v1/model/status
+//	{"backends":{"gemma4-q4km":{"model":"gemma4:31b-q4km","status":"ready","idle_seconds":42}}}
+//
+//	GET /v1/model/status?backend=gemma4-q4km
+//	{"model":"gemma4:31b-q4km","status":"loading"}
+func (hnd *Handler) HandleModelStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if name := r.URL.Query().Get("backend"); name != "" {
+		info, ok := hnd.h.ModelStatus(name)
+		if !ok {
+			http.Error(w,
+				fmt.Sprintf("backend %q not found or does not support status reporting", name),
+				http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(info)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"backends": hnd.h.AllModelStatuses(),
+	})
+}

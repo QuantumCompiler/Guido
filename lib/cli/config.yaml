@@ -21,24 +21,11 @@ backends:
     port: 8002
     model: "gemma4:31b-q4km"
     model_path: "${HOME}/.cache/huggingface/hub/models--google--gemma-4-31B/gguf/model-q4km.gguf"
+    idle_timeout_seconds: 60  # Unload from VRAM after N seconds idle (0 = keep loaded forever)
 
   # Multiple local models — use explicit "type: llamacpp" + unique key names
   # Each gets its own llama-server on a separate port (auto-assigned or explicit).
-  #
-  # gemma-small:
-  #   type: llamacpp
-  #   url: "embedded"
-  #   port: 8001                           # optional: pin to a specific port
-  #   model: "gemma-4-31b"
-  #   model_path: "${HOME}/.cache/huggingface/hub/models--google--gemma-4-31B/gguf/model-f16.gguf"
-  #
-  # mistral-fast:
-  #   type: llamacpp
-  #   url: "embedded"
-  #   port: 8002
-  #   model: "mistral-7b"
-  #   model_path: "${HOME}/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.1/gguf/model-q4_k_m.gguf"
-  #
+
   # Point to an already-running llama-server (no embedded spawn):
   # external-llm:
   #   type: llamacpp
@@ -70,11 +57,3 @@ backends:
 
   mock:
     model: "test-model"
-
-  # ─────────────────────────────────────────────────────────────────────
-  # HUGGINGFACE (local Python inference — slow, for experimentation)
-  # ─────────────────────────────────────────────────────────────────────
-
-  # huggingface:
-  #   model: "${HUGGINGFACE_MODEL}"
-  #   cache_dir: "${HUGGINGFACE_CACHE}"
