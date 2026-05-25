@@ -127,13 +127,14 @@ func main() {
 					gpuLayers = llamaGPU
 				}
 				modelPath := os.ExpandEnv(bcfg.ModelPath)
+				mmProjPath := os.ExpandEnv(bcfg.MmProjPath)
 				llamacppURL = fmt.Sprintf("http://localhost:%d", port)
 				idleTimeout := time.Duration(bcfg.IdleTimeoutSeconds) * time.Second
 
 				// Use a lazy backend so the llama-server only starts on the
-				// first request and can unload after idle_timeout_minutes.
+				// first request and can unload after idle_timeout_seconds.
 				lb := backends.NewLazyLlamaCppBackend(
-					toolMgr, modelPath, llamacppURL, model,
+					toolMgr, modelPath, mmProjPath, llamacppURL, model,
 					bcfg.ChatTemplate, port, gpuLayers, idleTimeout,
 				)
 				providers[name] = lb

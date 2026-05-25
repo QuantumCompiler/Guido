@@ -35,11 +35,11 @@ type ToolCallFunction struct {
 // ChatMessage represents a single message in a conversation.
 // Role is one of: "system", "user", "assistant", "tool".
 type ChatMessage struct {
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // set when role=="assistant" with tool calls
-	ToolCallID string     `json:"tool_call_id,omitempty"` // set when role=="tool"
-	Name       string     `json:"name,omitempty"`         // tool name (optional, role=="tool")
+	Role       string         `json:"role"`
+	Content    MessageContent `json:"content"`
+	ToolCalls  []ToolCall     `json:"tool_calls,omitempty"`   // set when role=="assistant" with tool calls
+	ToolCallID string         `json:"tool_call_id,omitempty"` // set when role=="tool"
+	Name       string         `json:"name,omitempty"`         // tool name (optional, role=="tool")
 }
 
 // ChatRequest represents a multi-turn chat request
@@ -114,6 +114,7 @@ type BackendConfig struct {
 	ChatTemplate       string                 `yaml:"chat_template" json:"chat_template"`           // e.g. "gemma", "llama3", "chatml", "mistral"
 	GPULayers          int                    `yaml:"gpu_layers" json:"gpu_layers"`                 // Override GPU layers (default 99)
 	IdleTimeoutSeconds int                    `yaml:"idle_timeout_seconds" json:"idle_timeout_seconds"` // Unload after N seconds idle (0 = never)
+	MmProjPath         string                 `yaml:"mmproj_path" json:"mmproj_path"`               // Path to multimodal projector for vision models
 	Extra              map[string]interface{} `yaml:"-" json:"-"`
 }
 

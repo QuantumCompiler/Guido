@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -30,6 +31,12 @@ var (
 	systemPrompt string
 	enableSearch bool // --search: give the model web_search + fetch_url tools
 	toolMgr      *tools.Manager
+)
+
+var (
+	contextStrings []string // --context
+	contextFiles   []string // --file
+	contextImages  []string // --image
 )
 
 var rootCmd = &cobra.Command{
@@ -105,9 +112,13 @@ var completeCmd = &cobra.Command{
 		// Use the chat endpoint so instruction-tuned models receive a properly
 		// formatted prompt rather than bare text (which they tend to ignore).
 		ctx := context.Background()
+		content, err := buildMessageContent(prompt, contextStrings, contextFiles, contextImages)
+		if err != nil {
+			log.Fatalf("Failed to build message: %v", err)
+		}
 		req := &harness.ChatRequest{
 			Messages: []harness.ChatMessage{
-				{Role: "user", Content: prompt},
+				{Role: "user", Content: content},
 			},
 			Model:       chatModel,
 			Temperature: temperature,
@@ -158,7 +169,7 @@ var chatCmd = &cobra.Command{
 		// Build conversation history
 		var history []harness.ChatMessage
 		if systemPrompt != "" {
-			history = append(history, harness.ChatMessage{Role: "system", Content: systemPrompt})
+			history = append(history, harness.ChatMessage{Role: "system", Content: harness.Text(systemPrompt)})
 		}
 
 		// Handle Ctrl+C gracefully — finish the current response then exit
@@ -181,6 +192,21 @@ var chatCmd = &cobra.Command{
 		}
 		fmt.Println(strings.Repeat("─", 50))
 
+		if len(contextFiles) > 0 || len(contextImages) > 0 || len(contextStrings) > 0 {
+			fmt.Print("Attached: ")
+			var labels []string
+			for _, f := range contextFiles {
+				labels = append(labels, filepath.Base(f))
+			}
+			for _, img := range contextImages {
+				labels = append(labels, filepath.Base(img)+" (image)")
+			}
+			if len(contextStrings) > 0 {
+				labels = append(labels, fmt.Sprintf("%d context string(s)", len(contextStrings)))
+			}
+			fmt.Println(strings.Join(labels, ", "))
+		}
+
 		scanner := bufio.NewScanner(os.Stdin)
 		for {
 			fmt.Print("\nYou: ")
@@ -197,7 +223,14 @@ var chatCmd = &cobra.Command{
 			}
 
 			// Add user message to history
-			history = append(history, harness.ChatMessage{Role: "user", Content: input})
+			content, err := buildMessageContent(input, contextStrings, contextFiles, contextImages)
+			if err != nil {
+				log.Printf("Error building message: %v", err)
+				continue
+			}
+			// Attachments apply to the first message only; clear after use.
+			contextStrings, contextFiles, contextImages = nil, nil, nil
+			history = append(history, harness.ChatMessage{Role: "user", Content: content})
 
 			if enableSearch {
 				// ── Agentic tool-calling loop ──────────────────────────────
@@ -225,7 +258,7 @@ var chatCmd = &cobra.Command{
 
 					if len(resp.Message.ToolCalls) == 0 {
 						// Final answer — print and break.
-						text := strings.TrimSpace(stripStopTokens(resp.Message.Content))
+						text := strings.TrimSpace(stripStopTokens(resp.Message.Content.PlainText()))
 						fmt.Printf("\nGuido: %s\n", text)
 						replied = true
 						break
@@ -255,7 +288,7 @@ var chatCmd = &cobra.Command{
 						history = append(history, harness.ChatMessage{
 							Role:       "tool",
 							ToolCallID: tc.ID,
-							Content:    result,
+							Content:    harness.Text(result),
 						})
 					}
 					// Loop — send tool results back to the model.
@@ -296,7 +329,7 @@ var chatCmd = &cobra.Command{
 				if assistantText != "" {
 					history = append(history, harness.ChatMessage{
 						Role:    "assistant",
-						Content: assistantText,
+						Content: harness.Text(assistantText),
 					})
 				}
 			}
@@ -465,18 +498,20 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 				llamacppURL = fmt.Sprintf("http://localhost:%d", port)
 				expandedModelPath := os.ExpandEnv(bcfg.ModelPath)
 
+				expandedMmProjPath := os.ExpandEnv(bcfg.MmProjPath)
+
 				if lazy {
 					// ── Lazy path (serve mode) ────────────────────────────────
 					// The LazyLlamaCppBackend manages the llama-server lifecycle
 					// internally: it starts on the first request and optionally
-					// unloads after idleTimeout minutes of inactivity.
+					// unloads after idleTimeout seconds of inactivity.
 					gpuLayers := bcfg.GPULayers
 					if gpuLayers == 0 {
 						gpuLayers = 99
 					}
 					idleTimeout := time.Duration(bcfg.IdleTimeoutSeconds) * time.Second
 					lb := backends.NewLazyLlamaCppBackend(
-						tm, expandedModelPath, llamacppURL, modelName,
+						tm, expandedModelPath, expandedMmProjPath, llamacppURL, modelName,
 						bcfg.ChatTemplate, port, gpuLayers, idleTimeout,
 					)
 					providers[name] = lb
@@ -506,7 +541,7 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 						if gpuLayers == 0 {
 							gpuLayers = 99
 						}
-						_, err := tm.StartLlamaServer(expandedModelPath, port, gpuLayers, bcfg.ChatTemplate)
+						_, err := tm.StartLlamaServer(expandedModelPath, port, gpuLayers, bcfg.ChatTemplate, expandedMmProjPath)
 						if err != nil {
 							log.Fatalf("Failed to start llama-server for %q: %v\n", name, err)
 						}
@@ -563,6 +598,14 @@ func init() {
 	chatCmd.Flags().IntVarP(&maxTokens, "max-tokens", "n", -1, "Maximum tokens to generate (-1 for unlimited)")
 	chatCmd.Flags().StringVarP(&systemPrompt, "system", "s", "", "System prompt to set the assistant's behavior")
 	chatCmd.Flags().BoolVar(&enableSearch, "search", false, "Give the model web_search and fetch_url tools (internet access)")
+
+	completeCmd.Flags().StringArrayVar(&contextStrings, "context", nil, "Raw string to inject as context before the prompt")
+	completeCmd.Flags().StringArrayVar(&contextFiles, "file", nil, "File to attach (text files injected as text, images base64-encoded)")
+	completeCmd.Flags().StringArrayVar(&contextImages, "image", nil, "Image file to attach (base64-encoded)")
+
+	chatCmd.Flags().StringArrayVar(&contextStrings, "context", nil, "Raw string to inject as context in the first message")
+	chatCmd.Flags().StringArrayVar(&contextFiles, "file", nil, "File to attach to the first message")
+	chatCmd.Flags().StringArrayVar(&contextImages, "image", nil, "Image to attach to the first message")
 
 	rootCmd.AddCommand(completeCmd)
 	rootCmd.AddCommand(chatCmd)
@@ -678,6 +721,82 @@ func stripStopTokens(token string) string {
 		}
 	}
 	return token
+}
+
+// buildMessageContent assembles a MessageContent from the user's text plus any
+// attached context strings, files, and images passed via CLI flags.
+// Returns plain-text MessageContent when no attachments are present (common case).
+func buildMessageContent(text string, contexts, files, images []string) (harness.MessageContent, error) {
+	if len(contexts) == 0 && len(files) == 0 && len(images) == 0 {
+		return harness.Text(text), nil
+	}
+
+	var parts []harness.ContentPart
+
+	for _, ctx := range contexts {
+		parts = append(parts, harness.TextPart(ctx))
+	}
+
+	for _, path := range files {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return harness.MessageContent{}, fmt.Errorf("reading %s: %w", path, err)
+		}
+		if isImageExt(filepath.Ext(path)) {
+			mime := mimeForExt(filepath.Ext(path))
+			parts = append(parts, harness.ImageURLPart(
+				"data:"+mime+";base64,"+base64.StdEncoding.EncodeToString(data),
+			))
+		} else {
+			// Text file — label it with the filename so the model knows the source
+			parts = append(parts, harness.TextPart(
+				fmt.Sprintf("=== %s ===\n%s", filepath.Base(path), string(data)),
+			))
+		}
+	}
+
+	for _, path := range images {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return harness.MessageContent{}, fmt.Errorf("reading image %s: %w", path, err)
+		}
+		mime := mimeForExt(filepath.Ext(path))
+		parts = append(parts, harness.ImageURLPart(
+			"data:"+mime+";base64,"+base64.StdEncoding.EncodeToString(data),
+		))
+	}
+
+	// User's message text goes last so context precedes the question
+	if text != "" {
+		parts = append(parts, harness.TextPart(text))
+	}
+
+	return harness.Parts(parts...), nil
+}
+
+func isImageExt(ext string) bool {
+	switch strings.ToLower(ext) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp":
+		return true
+	}
+	return false
+}
+
+func mimeForExt(ext string) string {
+	switch strings.ToLower(ext) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".bmp":
+		return "image/bmp"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 func main() {

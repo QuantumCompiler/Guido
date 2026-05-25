@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 
@@ -232,9 +233,9 @@ func (lcb *LlamaCppBackend) Chat(ctx context.Context, req *harness.ChatRequest) 
 	var result struct {
 		Choices []struct {
 			Message struct {
-				Role      string             `json:"role"`
-				Content   string             `json:"content"`
-				ToolCalls []harness.ToolCall `json:"tool_calls"`
+				Role      string                 `json:"role"`
+				Content   harness.MessageContent `json:"content"`
+				ToolCalls []harness.ToolCall     `json:"tool_calls"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -296,6 +297,8 @@ func (lcb *LlamaCppBackend) StreamChat(ctx context.Context, req *harness.ChatReq
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			log.Printf("llama.cpp stream error (HTTP %d): %s", resp.StatusCode, b)
 			return
 		}
 

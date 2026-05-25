@@ -86,13 +86,16 @@ func (mb *MockBackend) Chat(ctx context.Context, req *harness.ChatRequest) (*har
 	lastMsg := ""
 	for _, m := range req.Messages {
 		if m.Role == "user" {
-			lastMsg = m.Content
+			lastMsg = m.Content.PlainText()
 		}
 	}
 	text := fmt.Sprintf("[mock] You said: %q — %s", lastMsg, mb.response)
 
 	return &harness.ChatResponse{
-		Message:      harness.ChatMessage{Role: "assistant", Content: text},
+		Message: harness.ChatMessage{
+			Role:    "assistant",
+			Content: harness.Text(text),
+		},
 		FinishReason: "stop",
 		TokensUsed:   len(strings.Fields(text)),
 		Model:        mb.model,
@@ -109,7 +112,7 @@ func (mb *MockBackend) StreamChat(ctx context.Context, req *harness.ChatRequest)
 		lastMsg := ""
 		for _, m := range req.Messages {
 			if m.Role == "user" {
-				lastMsg = m.Content
+				lastMsg = m.Content.PlainText()
 			}
 		}
 		text := fmt.Sprintf("[mock] You said: %q — %s", lastMsg, mb.response)

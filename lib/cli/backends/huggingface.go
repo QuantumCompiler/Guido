@@ -123,7 +123,10 @@ func (hb *HuggingFaceBackend) Chat(ctx context.Context, req *harness.ChatRequest
 		return nil, err
 	}
 	return &harness.ChatResponse{
-		Message:      harness.ChatMessage{Role: "assistant", Content: resp.Text},
+		Message: harness.ChatMessage{
+			Role:    "assistant",
+			Content: harness.Text(resp.Text),
+		},
 		FinishReason: resp.FinishReason,
 		TokensUsed:   resp.TokensUsed,
 		Model:        resp.Model,
@@ -154,7 +157,7 @@ func messagesAsPrompt(messages []harness.ChatMessage) string {
 		case "assistant":
 			sb.WriteString("Assistant: ")
 		}
-		sb.WriteString(m.Content)
+		sb.WriteString(m.Content.PlainText())
 		sb.WriteString("\n")
 	}
 	sb.WriteString("Assistant:")

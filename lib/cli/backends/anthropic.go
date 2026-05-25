@@ -30,8 +30,64 @@ type anthropicRequest struct {
 }
 
 type anthropicMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+// toAnthropicContent converts a harness MessageContent to the Anthropic messages
+// wire format. Plain text stays a bare JSON string. Rich content becomes an
+// Anthropic content-block array, translating OpenAI image_url blocks into
+// Anthropic image source blocks.
+func toAnthropicContent(c harness.MessageContent) json.RawMessage {
+	parts := c.ContentParts()
+	if len(parts) == 0 {
+		raw, _ := json.Marshal(c.PlainText())
+		return raw
+	}
+
+	var blocks []map[string]interface{}
+	for _, p := range parts {
+		switch p.Type {
+		case "text":
+			blocks = append(blocks, map[string]interface{}{
+				"type": "text",
+				"text": p.Text,
+			})
+		case "image_url":
+			if p.ImageURL == nil {
+				continue
+			}
+			url := p.ImageURL.URL
+			if strings.HasPrefix(url, "data:") {
+				// data:image/jpeg;base64,/9j/...
+				comma := strings.Index(url, ",")
+				if comma < 0 {
+					continue
+				}
+				meta := strings.TrimPrefix(url[:comma], "data:") // "image/jpeg;base64"
+				mediaType := strings.SplitN(meta, ";", 2)[0]    // "image/jpeg"
+				data := url[comma+1:]
+				blocks = append(blocks, map[string]interface{}{
+					"type": "image",
+					"source": map[string]string{
+						"type":       "base64",
+						"media_type": mediaType,
+						"data":       data,
+					},
+				})
+			} else {
+				blocks = append(blocks, map[string]interface{}{
+					"type": "image",
+					"source": map[string]interface{}{
+						"type": "url",
+						"url":  url,
+					},
+				})
+			}
+		}
+	}
+	raw, _ := json.Marshal(blocks)
+	return raw
 }
 
 // anthropicResponse is the response format from Anthropic API
@@ -75,7 +131,7 @@ func (ab *AnthropicBackend) Complete(ctx context.Context, req *harness.Completio
 		Messages: []anthropicMessage{
 			{
 				Role:    "user",
-				Content: req.Prompt,
+				Content: toAnthropicContent(harness.Text(req.Prompt)),
 			},
 		},
 		Stream: false,
@@ -142,7 +198,7 @@ func (ab *AnthropicBackend) StreamTokens(ctx context.Context, req *harness.Compl
 			Messages: []anthropicMessage{
 				{
 					Role:    "user",
-					Content: req.Prompt,
+					Content: toAnthropicContent(harness.Text(req.Prompt)),
 				},
 			},
 			Stream: true,
@@ -258,9 +314,12 @@ func (ab *AnthropicBackend) Chat(ctx context.Context, req *harness.ChatRequest) 
 	}
 
 	return &harness.ChatResponse{
-		Message:      harness.ChatMessage{Role: "assistant", Content: text},
-		TokensUsed:   anthropicResp.Usage.OutputTokens,
-		Model:        ab.model,
+		Message: harness.ChatMessage{
+			Role:    "assistant",
+			Content: harness.Text(text),
+		},
+		TokensUsed: anthropicResp.Usage.OutputTokens,
+		Model:      ab.model,
 	}, nil
 }
 
@@ -343,10 +402,10 @@ func buildAnthropicChatRequest(model string, req *harness.ChatRequest, maxTokens
 
 	for _, m := range req.Messages {
 		if m.Role == "system" {
-			systemPrompt = m.Content
+			systemPrompt = m.Content.PlainText()
 			continue
 		}
-		msgs = append(msgs, anthropicMessage{Role: m.Role, Content: m.Content})
+		msgs = append(msgs, anthropicMessage{Role: m.Role, Content: toAnthropicContent(m.Content)})
 	}
 
 	return anthropicChatRequest{

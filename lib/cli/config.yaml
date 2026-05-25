@@ -21,6 +21,7 @@ backends:
     port: 8002
     model: "gemma4:31b-q4km"
     model_path: "${HOME}/.cache/huggingface/hub/models--google--gemma-4-31B/gguf/model-q4km.gguf"
+    mmproj_path: "${HOME}/.cache/huggingface/hub/models--google--gemma-4-31B/gguf/model-f16-mmproj.gguf"
     idle_timeout_seconds: 60  # Unload from VRAM after N seconds idle (0 = keep loaded forever)
 
   # Multiple local models — use explicit "type: llamacpp" + unique key names

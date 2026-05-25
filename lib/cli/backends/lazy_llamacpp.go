@@ -43,6 +43,7 @@ type LazyLlamaCppBackend struct {
 	// immutable startup config
 	toolMgr      *tools.Manager
 	modelPath    string
+	mmProjPath   string // optional multimodal projector (vision models)
 	baseURL      string
 	model        string
 	chatTemplate string
@@ -52,15 +53,17 @@ type LazyLlamaCppBackend struct {
 
 // NewLazyLlamaCppBackend creates a lazy-loading llama.cpp backend.
 // idleTimeout of 0 means "never unload once loaded".
+// mmProjPath is optional — set it to enable vision/multimodal support.
 func NewLazyLlamaCppBackend(
 	tm *tools.Manager,
-	modelPath, baseURL, model, chatTemplate string,
+	modelPath, mmProjPath, baseURL, model, chatTemplate string,
 	port, gpuLayers int,
 	idleTimeout time.Duration,
 ) *LazyLlamaCppBackend {
 	return &LazyLlamaCppBackend{
 		toolMgr:      tm,
 		modelPath:    modelPath,
+		mmProjPath:   mmProjPath,
 		baseURL:      baseURL,
 		model:        model,
 		chatTemplate: chatTemplate,
@@ -181,7 +184,7 @@ func (lb *LazyLlamaCppBackend) load(done chan struct{}) {
 		)
 
 	case lazyServerNotRunning:
-		_, err = lb.toolMgr.StartLlamaServer(lb.modelPath, lb.port, lb.gpuLayers, lb.chatTemplate)
+		_, err = lb.toolMgr.StartLlamaServer(lb.modelPath, lb.port, lb.gpuLayers, lb.chatTemplate, lb.mmProjPath)
 	}
 
 	lb.mu.Lock()

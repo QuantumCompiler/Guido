@@ -30,8 +30,8 @@ type openaiRequest struct {
 }
 
 type openaiMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string                `json:"role"`
+	Content harness.MessageContent `json:"content"`
 }
 
 // openaiResponse is the response format from OpenAI API
@@ -76,7 +76,7 @@ func (ob *OpenAIBackend) Complete(ctx context.Context, req *harness.CompletionRe
 		Messages: []openaiMessage{
 			{
 				Role:    "user",
-				Content: req.Prompt,
+				Content: harness.Text(req.Prompt),
 			},
 		},
 		Stream: false,
@@ -118,7 +118,7 @@ func (ob *OpenAIBackend) Complete(ctx context.Context, req *harness.CompletionRe
 	choice := openaiResp.Choices[0]
 
 	return &harness.CompletionResponse{
-		Text:         choice.Message.Content,
+		Text:         choice.Message.Content.PlainText(),
 		FinishReason: choice.FinishReason,
 		TokensUsed:   openaiResp.Usage.CompletionTokens,
 		Model:        ob.model,
@@ -144,7 +144,7 @@ func (ob *OpenAIBackend) StreamTokens(ctx context.Context, req *harness.Completi
 			Messages: []openaiMessage{
 				{
 					Role:    "user",
-					Content: req.Prompt,
+					Content: harness.Text(req.Prompt),
 				},
 			},
 			Stream: true,
@@ -261,7 +261,10 @@ func (ob *OpenAIBackend) Chat(ctx context.Context, req *harness.ChatRequest) (*h
 
 	choice := openaiResp.Choices[0]
 	return &harness.ChatResponse{
-		Message:      harness.ChatMessage{Role: choice.Message.Role, Content: choice.Message.Content},
+		Message: harness.ChatMessage{
+			Role:    choice.Message.Role,
+			Content: choice.Message.Content,
+		},
 		FinishReason: choice.FinishReason,
 		TokensUsed:   openaiResp.Usage.CompletionTokens,
 		Model:        ob.model,

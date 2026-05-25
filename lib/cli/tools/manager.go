@@ -57,8 +57,11 @@ func (m *Manager) GetToolPath(toolName string) (string, error) {
 }
 
 // StartLlamaServer starts llama-server with the given model and waits until it
-// is actually accepting connections (or times out). chatTemplate is optional.
-func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, chatTemplate string) (int, error) {
+// is actually accepting connections (or times out).
+// chatTemplate and mmProjPath are both optional (pass "" to omit).
+// mmProjPath is the path to a multimodal projector file — required for vision
+// models such as Gemma 4, LLaVA, Qwen-VL, etc.
+func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, chatTemplate, mmProjPath string) (int, error) {
 	toolPath, err := m.GetToolPath("llama-server")
 	if err != nil {
 		return 0, err
@@ -74,6 +77,9 @@ func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, c
 		// falls back to a simplified built-in template that silently ignores
 		// the `tools` field in /v1/chat/completions requests.
 		"--jinja",
+	}
+	if mmProjPath != "" {
+		args = append(args, "--mmproj", mmProjPath)
 	}
 	if chatTemplate != "" {
 		args = append(args, "--chat-template", chatTemplate)
