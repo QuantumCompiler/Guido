@@ -383,19 +383,32 @@ For `complete` and `chat` commands, loading is eager (loads immediately, cleans 
 
 ## MCP Tools
 
-Guido can connect to [Model Context Protocol](https://modelcontextprotocol.io) servers and expose their tools to the model. Any server runnable via `npx`, `uvx`, Python, or a direct executable is supported (stdio transport).
+Guido can connect to [Model Context Protocol](https://modelcontextprotocol.io) servers and expose their tools to the model. Two transports are supported:
+
+- **stdio** — Guido spawns a local subprocess (`npx`, `uvx`, Python, any executable) and communicates via stdin/stdout.
+- **HTTP+SSE** — Guido connects to a remote MCP server over HTTP. Requests go out as POST; responses arrive over a persistent Server-Sent Events stream.
 
 ### Setup
 
-Add an `mcp_servers` section to `~/.guido/config/config.yaml`:
+Add an `mcp_servers` section to `~/.guido/config/config.yaml`. Transport is selected automatically by which field you provide:
 
 ```yaml
 mcp_servers:
+  # Local subprocess (stdio)
   - name: devtools
     enabled: true
     command: python3
     args: ["/path/to/test-mcp-server.py"]
+
+  # Remote HTTP+SSE server
+  - name: my-remote
+    enabled: true
+    url: "https://mcp.example.com"
+    headers:
+      Authorization: "Bearer ${MY_API_TOKEN}"   # optional auth
 ```
+
+When both `url` and `command` are set, `url` takes precedence. `${ENV_VAR}` references in `url`, `args`, `env`, and `headers` values are expanded at startup.
 
 MCP tools are active by default — no extra flag required. Use `--native` to disable them, or `--mcp` to enable only MCP and disable web search.
 

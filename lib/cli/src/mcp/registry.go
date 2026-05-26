@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -15,7 +16,12 @@ type Registry struct {
 }
 
 // NewRegistry connects to all enabled MCP servers.
-// Failed connections are logged and skipped so a broken MCP server doesn't
+// Transport is selected automatically:
+//   - url set   → HTTP+SSE (spec 2024-11-05); auto-falls-back to Streamable HTTP (spec 2025-03-26) on HTTP 405
+//   - command set → stdio subprocess
+//   - both set  → url takes precedence
+//
+// Failed connections are logged and skipped so a broken server doesn't
 // prevent Guido from starting.
 func NewRegistry(ctx context.Context, servers []harness.MCPServerConfig) (*Registry, error) {
 	r := &Registry{clients: make(map[string]*Client)}
@@ -24,13 +30,33 @@ func NewRegistry(ctx context.Context, servers []harness.MCPServerConfig) (*Regis
 		if !srv.Enabled {
 			continue
 		}
-		if srv.Command == "" {
-			continue
-		}
 
-		transport, err := NewStdioTransport(ctx, srv.Command, srv.Args, srv.Env)
-		if err != nil {
-			fmt.Printf("[mcp] warning: %s: failed to start: %v\n", srv.Name, err)
+		var transport Transport
+		var err error
+
+		switch {
+		case srv.URL != "":
+			// Remote MCP server — try HTTP+SSE (spec 2024-11-05) first.
+			// If the server returns HTTP 405 it speaks Streamable HTTP (spec 2025-03-26) instead;
+			// fall back automatically so either protocol works with the same config.
+			transport, err = NewSSETransport(ctx, srv.URL, srv.Headers)
+			if errors.Is(err, ErrMethodNotAllowed) {
+				fmt.Printf("[mcp] %s: HTTP+SSE not supported, trying Streamable HTTP\n", srv.Name)
+				transport, err = NewStreamableTransport(ctx, srv.URL, srv.Headers)
+			}
+			if err != nil {
+				fmt.Printf("[mcp] warning: %s: connect failed: %v\n", srv.Name, err)
+				continue
+			}
+		case srv.Command != "":
+			// Local MCP server — stdio subprocess transport.
+			transport, err = NewStdioTransport(ctx, srv.Command, srv.Args, srv.Env)
+			if err != nil {
+				fmt.Printf("[mcp] warning: %s: failed to start: %v\n", srv.Name, err)
+				continue
+			}
+		default:
+			fmt.Printf("[mcp] warning: %s: skipped — set either url (remote) or command (local)\n", srv.Name)
 			continue
 		}
 

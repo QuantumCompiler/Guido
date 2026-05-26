@@ -174,14 +174,49 @@ func Serve(ctx context.Context, cfg *harness.Config, h *harness.Harness, tc *Too
 
 ## `src/mcp/` — MCP client
 
-Connects to external [Model Context Protocol](https://modelcontextprotocol.io) servers and exposes their tools to the LLM in the agentic loop. Uses JSON-RPC 2.0 over stdio (subprocess) transport. Zero external dependencies — stdlib only.
+Connects to external [Model Context Protocol](https://modelcontextprotocol.io) servers and exposes their tools to the LLM in the agentic loop. Zero external dependencies — stdlib only.
 
 | File | Purpose |
 |------|---------|
 | `types.go` | JSON-RPC 2.0 wire types (`Request`, `Notification`, `Response`, `IncomingMessage`, `RPCError`) and MCP-specific payloads (`InitializeParams/Result`, `ToolsListResult`, `MCPTool`, `ToolCallParams`, `ToolCallResult`, `ToolContent`) |
 | `transport.go` | `Transport` interface + `StdioTransport` — spawns a subprocess, pipes stdin/stdout, forwards stderr. 1 MB read buffer for large tool-list responses. Write-side mutex for thread safety |
+| `transport_sse.go` | `SSETransport` — connects to a remote MCP server via HTTP+SSE (protocol version 2024-11-05). A persistent `GET /sse` stream receives JSON-RPC responses; individual `POST` requests send messages. The session POST URL is discovered from the first `endpoint` SSE event |
 | `client.go` | `Client` — single server connection. Background `readLoop` goroutine demultiplexes responses via `pending map[int64]chan Response`. `initialize()` performs the MCP handshake. `loadTools()` fetches `tools/list` and caches results as namespaced `harness.Tool` values |
-| `registry.go` | `Registry` — multi-server manager. `NewRegistry` connects best-effort (failed servers are logged and skipped). `Tools()` returns the aggregated tool list. `ExecuteTool(ctx, name, argsJSON)` returns `(result, handled, err)` — `handled=false` signals the caller to fall through to built-in tools |
+| `registry.go` | `Registry` — multi-server manager. `NewRegistry` selects the transport (SSE when `url` is set, stdio when `command` is set), connects best-effort, and skips failures. `Tools()` returns the aggregated tool list. `ExecuteTool` returns `(result, handled, err)` — `handled=false` lets the caller fall through to built-in tools |
+
+### Transport selection
+
+`MCPServerConfig` in `harness/models.go` exposes both transport options:
+
+```yaml
+# stdio (local subprocess)
+- name: local
+  command: python3
+  args: ["/path/to/server.py"]
+
+# HTTP+SSE (remote)
+- name: remote
+  url: "https://mcp.example.com"
+  headers:
+    Authorization: "Bearer ${TOKEN}"
+```
+
+`NewRegistry` picks the transport by checking `srv.URL` first, then `srv.Command`. Both cannot be active simultaneously — `url` takes precedence.
+
+### HTTP+SSE transport protocol
+
+```
+Client                          Server
+  │                               │
+  ├─── GET /sse ──────────────────►│  (persistent SSE stream)
+  │                               │
+  │◄── event: endpoint ───────────┤  data: /messages?sessionId=abc
+  │                               │
+  ├─── POST /messages?sessionId=abc ►│  (each JSON-RPC request)
+  │◄── event: message ────────────┤  data: {"jsonrpc":"2.0","id":1,"result":{...}}
+```
+
+`SSETransport.Close()` cancels the context on the `GET` connection, which unblocks the background `readSSE` goroutine cleanly via Go's `net/http` context propagation.
 
 ### Tool namespacing
 
@@ -193,17 +228,17 @@ Each `Client` runs one background `readLoop` goroutine. Callers use `client.call
 
 ### Transport interface
 
-`Transport` is the seam for adding alternative transports:
+`Transport` is the seam between `Client` (protocol) and connection details (subprocess vs. HTTP):
 
 ```go
 type Transport interface {
-    Send(msg interface{}) error
+    Send(msg interface{}) error   // thread-safe
     Recv() (json.RawMessage, error)
     Close() error
 }
 ```
 
-A future `SSETransport` (HTTP server-sent events for remote MCP servers) can be added without changing `Client` or `Registry`.
+`Client` and `Registry` are transport-agnostic — adding a new transport (e.g. WebSocket) requires only implementing this interface.
 
 ---
 

@@ -93,15 +93,30 @@ type Config struct {
 	MCPServers []MCPServerConfig       `yaml:"mcp_servers" json:"mcp_servers"`
 }
 
-// MCPServerConfig describes one MCP server to connect to via stdio transport.
+// MCPServerConfig describes one MCP server to connect to.
 // Tools exposed by the server appear in the agentic loop as "mcp__<name>__<tool>".
+//
+// Transport selection:
+//   - url set → HTTP+SSE transport (remote server)
+//   - command set → stdio transport (local subprocess)
+//   - both set → url takes precedence
 type MCPServerConfig struct {
 	// Name is the unique identifier used for tool namespacing.
 	Name string `yaml:"name" json:"name"`
 	// Enabled allows temporarily disabling a server without removing its config.
-	// A server with an empty Command is also skipped.
 	Enabled bool `yaml:"enabled" json:"enabled"`
-	// Command is the executable to spawn (e.g. "npx", "uvx", "python").
+
+	// ── HTTP+SSE (remote) ─────────────────────────────────────────────────────
+	// URL is the base URL of a remote MCP server (e.g. "https://mcp.example.com").
+	// Guido connects to <url>/sse and discovers the session POST endpoint from
+	// the first "endpoint" SSE event.
+	URL string `yaml:"url" json:"url"`
+	// Headers are extra HTTP request headers sent on every SSE and POST request.
+	// Use this for authentication: {"Authorization": "Bearer <token>"}.
+	Headers map[string]string `yaml:"headers" json:"headers"`
+
+	// ── stdio (local subprocess) ──────────────────────────────────────────────
+	// Command is the executable to spawn (e.g. "npx", "uvx", "python3").
 	Command string `yaml:"command" json:"command"`
 	// Args are the arguments passed to Command.
 	Args []string `yaml:"args" json:"args"`
