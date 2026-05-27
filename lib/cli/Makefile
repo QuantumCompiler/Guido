@@ -1,4 +1,4 @@
-.PHONY: help build build-llama build-go clean install symlinks test dev-build
+.PHONY: help build build-llama build-go build-embedded stage-embed clean install symlinks test dev-build
 
 # Detect OS and architecture
 UNAME_S := $(shell uname -s)
@@ -36,15 +36,21 @@ SYMLINK_DIR := /usr/local/bin
 LLAMA_BUILD_DIR := $(MODULES_DIR)/llama.cpp/build
 LLAMA_TOOLS_DIR := $(BIN_DIR)/llama-cpp-tools
 
+EMBED_DIR       := src/embeddedtools/data
+EMBED_BIN_DIR   := $(EMBED_DIR)/bin
+EMBED_LIB_DIR   := $(EMBED_DIR)/lib
+
 help:
 	@echo "Guido - LLM Model Harness Build System"
 	@echo ""
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Targets:"
-	@echo "  build           Build everything (llama.cpp tools + Go binaries)"
+	@echo "  build           Build everything — llama.cpp tools + self-contained embedded binary"
 	@echo "  build-llama     Build only llama.cpp tools"
 	@echo "  build-go        Build only Go binaries (requires build-llama first)"
+	@echo "  stage-embed     Copy compiled tools into src/embeddedtools/data/ for embedding"
+	@echo "  build-embedded  stage-embed + build self-contained binary (-tags embed_tools)"
 	@echo "  clean           Clean build artifacts"
 	@echo "  install         Build + copy config + create symlinks in $(SYMLINK_DIR)"
 	@echo "  symlinks        (Re)create /usr/local/bin symlinks without rebuilding"
@@ -52,8 +58,9 @@ help:
 	@echo ""
 	@echo "Build info: $(OS)-$(ARCH) v$(VERSION)"
 
-# Main build target
-build: build-llama build-go
+# Main build target — compiles llama.cpp tools, stages them for embedding,
+# then builds self-contained Go binaries with all tools baked in.
+build: build-llama build-embedded
 
 # Build llama.cpp tools
 build-llama:
@@ -68,6 +75,40 @@ build-go:
 	@go build -o $(BIN_DIR)/guido-harness ./src/cmd/harness
 	@go build -o $(BIN_DIR)/guido         ./src/cmd/cli
 	@echo "✓ Go binaries built: $(BIN_DIR)/guido-{harness,} "
+
+# Copy compiled llama.cpp tools into the embed staging directory.
+# Run this after build-llama; it populates src/embeddedtools/data/ which is
+# compiled into the binary by build-embedded.
+stage-embed:
+	@echo "Staging tools for embedding..."
+	@mkdir -p $(EMBED_BIN_DIR) $(EMBED_LIB_DIR)
+	@# Copy key executables (skip Python scripts which need a runtime anyway)
+	@for tool in llama-server llama-cli llama-quantize llama-gguf llama-imatrix llama-bench; do \
+		src="$(LLAMA_TOOLS_DIR)/$$tool"; \
+		if [ -f "$$src" ]; then \
+			cp "$$src" "$(EMBED_BIN_DIR)/$$tool"; \
+			echo "  bin/$$tool"; \
+		fi; \
+	done
+	@# Copy shared libraries (macOS dylibs / Linux .so files)
+	@find "$(LLAMA_BUILD_DIR)/bin" -maxdepth 1 \( -name "*.dylib" -o -name "*.so*" \) | while read lib; do \
+		name=$$(basename "$$lib"); \
+		cp "$$lib" "$(EMBED_LIB_DIR)/$$name"; \
+		echo "  lib/$$name"; \
+	done
+	@# Write version stamp so the runtime can skip re-extraction on identical builds
+	@echo "$(VERSION)-$(OS)-$(ARCH)" > $(EMBED_DIR)/.version
+	@echo "✓ Staged to $(EMBED_DIR)/ (version: $(VERSION)-$(OS)-$(ARCH))"
+
+# Build self-contained binaries with all llama.cpp tools baked in.
+# Requires build-llama (or an existing LLAMA_TOOLS_DIR) to have run first.
+build-embedded: stage-embed
+	@echo "Building self-contained embedded binaries..."
+	@mkdir -p $(BIN_DIR)
+	@go build -tags embed_tools -o $(BIN_DIR)/guido-harness ./src/cmd/harness
+	@go build -tags embed_tools -o $(BIN_DIR)/guido         ./src/cmd/cli
+	@echo "✓ Self-contained binaries built: $(BIN_DIR)/guido-{harness,}"
+	@echo "  (llama.cpp tools are embedded — no external dependencies needed)"
 
 # Install binary, config, and /usr/local/bin symlinks
 install: build

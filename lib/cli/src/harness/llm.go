@@ -10,6 +10,15 @@ type StatusReporter interface {
 	ModelStatus() ModelStatusInfo
 }
 
+// InTextToolCaller is an optional interface implemented by backends that embed
+// tool calls inside the text stream (e.g. llamacpp system-prompt injection).
+// When a backend satisfies this interface the CLI's agentic loop can use a
+// streaming response with a short lookahead buffer to detect tool calls,
+// rather than waiting for the full non-streaming response.
+type InTextToolCaller interface {
+	UsesInTextToolCalls() bool
+}
+
 // LLMProvider is the interface that all model backends must implement
 type LLMProvider interface {
 	// Complete sends a single-turn completion request and returns a response
@@ -104,6 +113,18 @@ func (h *Harness) StreamChat(ctx context.Context, req *ChatRequest) (<-chan stri
 	}
 
 	return provider.StreamChat(ctx, req)
+}
+
+// UsesInTextToolCalls returns true when the backend for model embeds tool calls
+// in the text response (llamacpp system-prompt injection). The CLI uses this to
+// decide whether to stream the agentic loop with lookahead detection.
+func (h *Harness) UsesInTextToolCalls(model string) bool {
+	provider, err := h.router.Route(model)
+	if err != nil {
+		return false
+	}
+	itc, ok := provider.(InTextToolCaller)
+	return ok && itc.UsesInTextToolCalls()
 }
 
 // ModelStatus returns the status of a named backend if it implements StatusReporter.

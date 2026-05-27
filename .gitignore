@@ -26,3 +26,6 @@ Thumbs.db
 # Go
 *.exe
 go.sum
+
+# Other
+lib/cli/src/embeddedtools/data/

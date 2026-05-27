@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"guido/lib/cli/src/backends"
+	"guido/lib/cli/src/embeddedtools"
 	"guido/lib/cli/src/harness"
 	"guido/lib/cli/src/httpserver"
 	"guido/lib/cli/src/mcp"
@@ -55,24 +56,39 @@ var rootCmd = &cobra.Command{
 	Short: "Guido - LLM Model Harness",
 	Long:  `Guido is a unified interface for interacting with local and cloud LLM models.`,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		// Initialize tool manager once for all commands
-		toolsDir := os.Getenv("GUIDO_TOOLS_DIR")
-		if toolsDir == "" {
-			// Try relative to current directory
-			toolsDir = "exec/bin/llama-cpp-tools"
-			if _, err := os.Stat(toolsDir); os.IsNotExist(err) {
-				// Try relative to executable
-				exePath, err := os.Executable()
-				if err == nil {
-					toolsDir = filepath.Join(filepath.Dir(exePath), "llama-cpp-tools")
-				}
+		// Resolve tools directory — checked in priority order:
+		// 1. $GUIDO_TOOLS_DIR env var (explicit override)
+		// 2. exec/bin/llama-cpp-tools relative to CWD (dev/project layout)
+		// 3. llama-cpp-tools adjacent to the installed binary
+		// 4. Embedded tools baked into the binary (embed_tools build tag)
+		var err error
+		if toolsDir := os.Getenv("GUIDO_TOOLS_DIR"); toolsDir != "" {
+			toolMgr, err = tools.NewManagerFromDir(toolsDir)
+		} else if _, statErr := os.Stat("exec/bin/llama-cpp-tools"); statErr == nil {
+			toolMgr, err = tools.NewManagerFromDir("exec/bin/llama-cpp-tools")
+		} else if exePath, exeErr := os.Executable(); exeErr == nil {
+			// Resolve symlinks so /usr/local/bin/guido → .../exec/bin/guido
+			// before looking for llama-cpp-tools in the same directory.
+			if resolved, resErr := filepath.EvalSymlinks(exePath); resErr == nil {
+				exePath = resolved
+			}
+			adj := filepath.Join(filepath.Dir(exePath), "llama-cpp-tools")
+			if _, statErr := os.Stat(adj); statErr == nil {
+				toolMgr, err = tools.NewManagerFromDir(adj)
 			}
 		}
 
-		var err error
-		toolMgr, err = tools.NewManagerFromDir(toolsDir)
-		if err != nil {
-			log.Fatalf("Failed to initialize tools: %v", err)
+		if toolMgr == nil && err == nil {
+			// Fall back to tools embedded in the binary (no-op in stub builds).
+			extractDir := filepath.Join(os.Getenv("HOME"), ".guido", "tools")
+			toolMgr, err = tools.ExtractEmbedded(embeddedtools.ToolsFS, extractDir)
+		}
+
+		if toolMgr == nil {
+			if err != nil {
+				log.Fatalf("Failed to initialize tools: %v", err)
+			}
+			log.Fatalf("Tools not found. Set $GUIDO_TOOLS_DIR or run 'make build'.")
 		}
 	},
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
@@ -142,11 +158,12 @@ var completeCmd = &cobra.Command{
 
 		if len(activeTools) > 0 {
 			// Agentic loop — run until the model gives a final answer.
-			text, err := runAgenticLoop(ctx, h, &history, chatModel, temperature, maxTokens, activeTools, mcpReg, true)
+			// Pass "" as finalPrefix: the loop prints the answer directly with
+			// no label (complete is a one-shot command, no "Guido:" needed).
+			_, err := runAgenticLoop(ctx, h, &history, chatModel, temperature, maxTokens, activeTools, mcpReg, true, "")
 			if err != nil {
 				log.Fatalf("Completion error: %v", err)
 			}
-			fmt.Println(text)
 		} else {
 			// No tools — stream the response directly.
 			req := &harness.ChatRequest{
@@ -288,12 +305,13 @@ var chatCmd = &cobra.Command{
 
 			if len(activeTools) > 0 {
 				// ── Agentic tool-calling loop ──────────────────────────────
-				text, err := runAgenticLoop(ctx, h, &history, chatModel, temperature, maxTokens, activeTools, mcpReg, true)
+				// finalPrefix="\nGuido: " is printed once, right before the
+				// final answer — whether it streams token-by-token or arrives
+				// as a single block. No re-print needed after the call returns.
+				_, err := runAgenticLoop(ctx, h, &history, chatModel, temperature, maxTokens, activeTools, mcpReg, true, "\nGuido: ")
 				if err != nil {
 					log.Printf("Error: %v", err)
 					history = history[:len(history)-1] // undo user message
-				} else {
-					fmt.Printf("\nGuido: %s\n", text)
 				}
 			} else {
 				// ── Normal streaming path (no tools) ──────────────────────
@@ -538,6 +556,15 @@ func dispatchTool(ctx context.Context, tc harness.ToolCall, mcpReg *mcp.Registry
 // runAgenticLoop drives the model→tool→model cycle until the model stops
 // requesting tool calls. It appends each turn to *history in place and
 // returns the final assistant text.
+//
+// When the backend uses in-text tool calls (llamacpp system-prompt injection),
+// the loop uses a streaming path with a short lookahead buffer so the final
+// answer streams to the terminal token-by-token. Other backends use the
+// non-streaming Chat() path unchanged.
+//
+// finalPrefix is printed immediately before the final answer text (e.g.
+// "\nGuido: " in the chat command, "" in complete). It is printed exactly once,
+// whether the answer is streamed or returned as a single block.
 func runAgenticLoop(
 	ctx context.Context,
 	h *harness.Harness,
@@ -548,7 +575,10 @@ func runAgenticLoop(
 	activeTools []harness.Tool,
 	mcpReg *mcp.Registry,
 	printProgress bool,
+	finalPrefix string,
 ) (string, error) {
+	useStreaming := len(activeTools) > 0 && h.UsesInTextToolCalls(chatModel)
+
 	for {
 		req := &harness.ChatRequest{
 			Messages:    *history,
@@ -557,6 +587,34 @@ func runAgenticLoop(
 			MaxTokens:   maxTokens,
 			Tools:       activeTools,
 		}
+
+		if useStreaming {
+			text, toolCalls, err := streamingAgenticTurn(ctx, h, req, printProgress, finalPrefix)
+			if err != nil {
+				return "", err
+			}
+
+			if len(toolCalls) > 0 {
+				*history = append(*history, harness.ChatMessage{
+					Role:      "assistant",
+					Content:   harness.Text(""),
+					ToolCalls: toolCalls,
+				})
+				if err := dispatchToolCalls(ctx, toolCalls, history, mcpReg, printProgress); err != nil {
+					return "", err
+				}
+				continue
+			}
+
+			final := strings.TrimSpace(stripStopTokens(text))
+			*history = append(*history, harness.ChatMessage{
+				Role:    "assistant",
+				Content: harness.Text(final),
+			})
+			return final, nil
+		}
+
+		// Non-streaming path (OpenAI, Anthropic, etc.).
 		resp, err := h.Chat(ctx, req)
 		if err != nil {
 			return "", err
@@ -564,36 +622,131 @@ func runAgenticLoop(
 		*history = append(*history, resp.Message)
 
 		if len(resp.Message.ToolCalls) == 0 {
-			return strings.TrimSpace(stripStopTokens(resp.Message.Content.PlainText())), nil
+			text := strings.TrimSpace(stripStopTokens(resp.Message.Content.PlainText()))
+			if printProgress {
+				fmt.Print(finalPrefix)
+				fmt.Println(text)
+			}
+			return text, nil
 		}
 
-		for _, tc := range resp.Message.ToolCalls {
-			if printProgress {
-				var toolArgs map[string]interface{}
-				_ = json.Unmarshal([]byte(tc.Function.Arguments), &toolArgs)
-				switch tc.Function.Name {
-				case "web_search":
-					q, _ := toolArgs["query"].(string)
-					fmt.Printf("\n[searching] %q...\n", q)
-				case "fetch_url":
-					u, _ := toolArgs["url"].(string)
-					fmt.Printf("\n[fetching] %s...\n", u)
-				default:
-					fmt.Printf("\n[tool] %s %v\n", tc.Function.Name, toolArgs)
-				}
-			}
-			result, execErr := dispatchTool(ctx, tc, mcpReg)
-			if execErr != nil {
-				result = "Error: " + execErr.Error()
-			}
-			*history = append(*history, harness.ChatMessage{
-				Role:       "tool",
-				ToolCallID: tc.ID,
-				Name:       tc.Function.Name,
-				Content:    harness.Text(result),
-			})
+		if err := dispatchToolCalls(ctx, resp.Message.ToolCalls, history, mcpReg, printProgress); err != nil {
+			return "", err
 		}
 	}
+}
+
+// streamingAgenticTurn calls h.StreamChat and uses a lookahead buffer to
+// distinguish tool-call turns from final-answer turns without waiting for the
+// full response.
+//
+// Decision rule (for llamacpp system-prompt injection):
+//   - If the first ≥10 non-whitespace characters start with "TOOL_CALL:" →
+//     the entire response is a tool call. Buffer silently; return tool calls.
+//   - Otherwise → flush the buffer to the terminal, then stream remaining
+//     tokens live. Return the full accumulated text with no tool calls.
+//
+// The lookahead adds at most ~3 token delays before printing begins (negligible).
+func streamingAgenticTurn(
+	ctx context.Context,
+	h *harness.Harness,
+	req *harness.ChatRequest,
+	printProgress bool,
+	prefix string,
+) (text string, toolCalls []harness.ToolCall, err error) {
+	const lookahead = len("TOOL_CALL:") // 10 — enough to distinguish
+
+	stream, err := h.StreamChat(ctx, req)
+	if err != nil {
+		return "", nil, err
+	}
+
+	var buf strings.Builder
+	decided := false
+	isContent := false // true once we've determined this is a content turn
+
+	for token := range stream {
+		buf.WriteString(token)
+
+		if !decided {
+			peeked := strings.TrimSpace(buf.String())
+
+			// Can we make a decision yet?
+			// Yes when: we have ≥ lookahead chars, OR we can already rule out
+			// "TOOL_CALL:" because the prefix doesn't match.
+			canDecide := len(peeked) >= lookahead ||
+				(len(peeked) > 0 && !strings.HasPrefix("TOOL_CALL:", peeked))
+
+			if canDecide {
+				decided = true
+				isContent = !strings.HasPrefix(peeked, "TOOL_CALL:")
+				if isContent && printProgress {
+					fmt.Print(prefix)       // e.g. "\nGuido: " in chat, "" in complete
+					fmt.Print(buf.String()) // flush buffered content
+				}
+			}
+			// else: keep buffering — still ambiguous
+		} else if isContent && printProgress {
+			fmt.Print(token) // stream live
+		}
+	}
+
+	// Handle streams that ended before we accumulated enough to decide
+	// (very short responses — treat as content).
+	if !decided {
+		peeked := strings.TrimSpace(buf.String())
+		isContent = !strings.HasPrefix(peeked, "TOOL_CALL:")
+		if isContent && printProgress {
+			fmt.Print(prefix)
+			fmt.Print(buf.String())
+		}
+	}
+
+	if isContent && printProgress {
+		fmt.Println()
+	}
+
+	fullText := buf.String()
+	tcs := backends.ParseToolCalls(fullText)
+	return fullText, tcs, nil
+}
+
+// dispatchToolCalls executes every tool call, logs progress, and appends tool
+// result messages to *history.
+func dispatchToolCalls(
+	ctx context.Context,
+	calls []harness.ToolCall,
+	history *[]harness.ChatMessage,
+	mcpReg *mcp.Registry,
+	printProgress bool,
+) error {
+	for _, tc := range calls {
+		if printProgress {
+			var toolArgs map[string]interface{}
+			_ = json.Unmarshal([]byte(tc.Function.Arguments), &toolArgs)
+			switch tc.Function.Name {
+			case "web_search":
+				q, _ := toolArgs["query"].(string)
+				fmt.Printf("\n[searching] %q...\n", q)
+			case "fetch_url":
+				u, _ := toolArgs["url"].(string)
+				fmt.Printf("\n[fetching] %s...\n", u)
+			default:
+				fmt.Printf("\n[tool] %s %v\n", tc.Function.Name, toolArgs)
+			}
+		}
+		result, execErr := dispatchTool(ctx, tc, mcpReg)
+		if execErr != nil {
+			result = "Error: " + execErr.Error()
+		}
+		*history = append(*history, harness.ChatMessage{
+			Role:       "tool",
+			ToolCallID: tc.ID,
+			Name:       tc.Function.Name,
+			Content:    harness.Text(result),
+		})
+	}
+	return nil
 }
 
 // target="" falls through to cfg.Models.Default.

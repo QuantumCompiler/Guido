@@ -14,7 +14,8 @@ import (
 
 // Manager handles lifecycle of tools
 type Manager struct {
-	toolsDir string     // Directory where tools are located
+	toolsDir string     // Directory where tool executables are located
+	libDir   string     // Directory of shared libraries (dylibs on macOS); "" if absent
 	launched map[string]*ManagedProcess
 }
 
@@ -89,6 +90,17 @@ func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, c
 	cmd := exec.Command(toolPath, args...)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
+
+	// When tools were extracted from an embedded binary the dylibs live in
+	// m.libDir rather than the rpath baked into the executables.  Inject the
+	// appropriate loader env var so the dynamic linker finds them.
+	if m.libDir != "" {
+		libEnvKey := "DYLD_LIBRARY_PATH" // macOS
+		if runtime.GOOS == "linux" {
+			libEnvKey = "LD_LIBRARY_PATH"
+		}
+		cmd.Env = append(os.Environ(), libEnvKey+"="+m.libDir)
+	}
 
 	fmt.Printf("[guido] starting llama-server on port %d...\n", port)
 

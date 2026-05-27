@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"guido/lib/cli/src/backends"
+	"guido/lib/cli/src/embeddedtools"
 	"guido/lib/cli/src/harness"
 	"guido/lib/cli/src/httpserver"
 	"guido/lib/cli/src/tools"
@@ -52,18 +53,35 @@ func main() {
 	}
 
 	// ── Tool manager ──────────────────────────────────────────────────────────
-	toolsDir := os.Getenv("GUIDO_TOOLS_DIR")
-	if toolsDir == "" {
-		toolsDir = "lib/cli/exec/bin/llama-cpp-tools"
-		if _, err := os.Stat(toolsDir); os.IsNotExist(err) {
-			if exe, err := os.Executable(); err == nil {
-				toolsDir = filepath.Join(filepath.Dir(exe), "llama-cpp-tools")
-			}
+	// Resolution order:
+	// 1. $GUIDO_TOOLS_DIR env var
+	// 2. lib/cli/exec/bin/llama-cpp-tools relative to CWD (mono-repo layout)
+	// 3. llama-cpp-tools adjacent to binary
+	// 4. Tools embedded in the binary (embed_tools build tag)
+	var toolMgr *tools.Manager
+	if td := os.Getenv("GUIDO_TOOLS_DIR"); td != "" {
+		toolMgr, err = tools.NewManagerFromDir(td)
+	} else if _, statErr := os.Stat("lib/cli/exec/bin/llama-cpp-tools"); statErr == nil {
+		toolMgr, err = tools.NewManagerFromDir("lib/cli/exec/bin/llama-cpp-tools")
+	} else if exe, exeErr := os.Executable(); exeErr == nil {
+		// Resolve symlinks before directory lookup.
+		if resolved, resErr := filepath.EvalSymlinks(exe); resErr == nil {
+			exe = resolved
+		}
+		adj := filepath.Join(filepath.Dir(exe), "llama-cpp-tools")
+		if _, statErr := os.Stat(adj); statErr == nil {
+			toolMgr, err = tools.NewManagerFromDir(adj)
 		}
 	}
-	toolMgr, err := tools.NewManagerFromDir(toolsDir)
-	if err != nil {
-		log.Fatalf("Failed to initialize tools: %v", err)
+	if toolMgr == nil && err == nil {
+		extractDir := filepath.Join(os.Getenv("HOME"), ".guido", "tools")
+		toolMgr, err = tools.ExtractEmbedded(embeddedtools.ToolsFS, extractDir)
+	}
+	if toolMgr == nil {
+		if err != nil {
+			log.Fatalf("Failed to initialize tools: %v", err)
+		}
+		log.Fatalf("Tools not found. Set $GUIDO_TOOLS_DIR or run 'make build'.")
 	}
 
 	// ── Backends ──────────────────────────────────────────────────────────────

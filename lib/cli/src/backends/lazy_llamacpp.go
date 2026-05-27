@@ -76,6 +76,9 @@ func NewLazyLlamaCppBackend(
 
 // ── StatusReporter ────────────────────────────────────────────────────────────
 
+// UsesInTextToolCalls implements harness.InTextToolCaller — delegates to inner.
+func (lb *LazyLlamaCppBackend) UsesInTextToolCalls() bool { return true }
+
 // ModelStatus implements harness.StatusReporter.
 func (lb *LazyLlamaCppBackend) ModelStatus() harness.ModelStatusInfo {
 	lb.mu.Lock()

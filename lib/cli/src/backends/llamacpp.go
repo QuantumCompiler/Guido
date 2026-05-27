@@ -39,6 +39,11 @@ type llamaCppCompletionResponse struct {
 	Tokens     int    `json:"tokens_evaluated"`
 }
 
+// UsesInTextToolCalls implements harness.InTextToolCaller.
+// llamacpp uses system-prompt injection: tool calls appear as TOOL_CALL: lines
+// in the text stream, making streaming with lookahead detection possible.
+func (lcb *LlamaCppBackend) UsesInTextToolCalls() bool { return true }
+
 // NewLlamaCppBackend creates a new llama.cpp backend
 func NewLlamaCppBackend(baseURL, model string) *LlamaCppBackend {
 	return &LlamaCppBackend{
@@ -447,8 +452,101 @@ func (lcb *LlamaCppBackend) chatWithToolPrompt(ctx context.Context, req *harness
 	}, nil
 }
 
-// StreamChat implements harness.LLMProvider — streaming multi-turn chat via SSE
+// streamChatWithToolPrompt is the streaming counterpart of chatWithToolPrompt.
+// It rewrites messages for system-prompt injection (same as the non-streaming
+// version) but calls llama-server's SSE API so tokens arrive as they are
+// generated. The raw token stream is returned — TOOL_CALL: lines, if any,
+// flow through as ordinary text so the caller can apply lookahead detection.
+func (lcb *LlamaCppBackend) streamChatWithToolPrompt(ctx context.Context, req *harness.ChatRequest) (<-chan string, error) {
+	msgs := rewriteMessagesForTools(req.Messages)
+
+	prompt := toolSystemPrompt(req.Tools)
+	if len(msgs) > 0 && msgs[0].Role == "system" {
+		msgs[0].Content = harness.Text(prompt + "\n\n" + msgs[0].Content.PlainText())
+	} else {
+		msgs = append([]harness.ChatMessage{{Role: "system", Content: harness.Text(prompt)}}, msgs...)
+	}
+
+	chatReq := llamaCppChatRequest{
+		Messages:    msgs,
+		Temperature: req.Temperature,
+		MaxTokens:   req.MaxTokens,
+		Stream:      true,
+		Stop:        defaultStopSequences,
+		// Tools omitted — using system-prompt injection
+	}
+
+	body, err := json.Marshal(chatReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal chat request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/v1/chat/completions", lcb.baseURL), bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create chat request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := lcb.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("chat request failed: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("llama.cpp returned status %d: %s", resp.StatusCode, b)
+	}
+
+	tokenChan := make(chan string)
+	go func() {
+		defer close(tokenChan)
+		defer resp.Body.Close()
+
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			payload := strings.TrimPrefix(line, "data: ")
+			if payload == "[DONE]" {
+				return
+			}
+
+			var chunk sseChunk
+			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+				continue
+			}
+
+			if len(chunk.Choices) > 0 {
+				if content := chunk.Choices[0].Delta.Content; content != "" {
+					select {
+					case tokenChan <- content:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}
+	}()
+
+	return tokenChan, nil
+}
+
+// ParseToolCalls scans text for TOOL_CALL: lines and returns the parsed ToolCall
+// structs. Exported so the CLI's streaming agentic loop can detect tool calls
+// from a lookahead-buffered token stream.
+func ParseToolCalls(text string) []harness.ToolCall { return parseToolCalls(text) }
+
+// StreamChat implements harness.LLMProvider — streaming multi-turn chat via SSE.
+// When req.Tools is non-empty it delegates to streamChatWithToolPrompt so that
+// tool calls are handled via system-prompt injection on the streaming path too.
 func (lcb *LlamaCppBackend) StreamChat(ctx context.Context, req *harness.ChatRequest) (<-chan string, error) {
+	if len(req.Tools) > 0 {
+		return lcb.streamChatWithToolPrompt(ctx, req)
+	}
+
 	tokenChan := make(chan string)
 
 	go func() {

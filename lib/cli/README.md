@@ -10,9 +10,11 @@ A unified Go-based harness for local and cloud LLM models. Run a single model fr
 
 ```bash
 cd lib/cli
-make build    # compile llama.cpp + build guido binary
-make install  # install to ~/bin/guido + config to ~/.guido/config/
+make build    # compile llama.cpp → stage tools → build self-contained guido binary
+make install  # build + copy config to ~/.guido/config/ + /usr/local/bin symlinks
 ```
+
+`make build` produces a single self-contained binary at `exec/bin/guido`. The binary has all llama.cpp tools (`llama-server`, `llama-cli`, `llama-quantize`, and shared libraries) baked directly inside using Go's `//go:embed`. On the first run in a new location it silently extracts them to `~/.guido/tools/`; subsequent runs skip extraction.
 
 `make install` places the binary at `~/bin/guido` and writes a starter config to `~/.guido/config/config.yaml` (skipped if the file already exists). It also creates `/usr/local/bin` symlinks for `guido`, `guido-harness`, and every tool in `exec/bin/llama-cpp-tools/`.
 
@@ -106,7 +108,7 @@ guido chat [flags]
 
 Starts a multi-turn conversation in your terminal. Full message history is maintained in memory and re-sent each request (llama-server's prompt cache speeds up repeated prefixes). Type `exit` or press Ctrl+C to quit.
 
-When tools are active the response loop is non-streaming — the model can call tools before producing a final answer. Without tools, responses stream token-by-token.
+When using a llamacpp backend with tools active, responses stream token-by-token for the final answer — intermediate tool-call turns are silent. With OpenAI/Anthropic backends, tool turns use the non-streaming `Chat()` path. Without tools, all backends stream.
 
 ```bash
 # All available tools (MCP from config + web search)
@@ -383,10 +385,13 @@ For `complete` and `chat` commands, loading is eager (loads immediately, cleans 
 
 ## MCP Tools
 
-Guido can connect to [Model Context Protocol](https://modelcontextprotocol.io) servers and expose their tools to the model. Two transports are supported:
+Guido can connect to [Model Context Protocol](https://modelcontextprotocol.io) servers and expose their tools to the model. Three transports are supported:
 
 - **stdio** — Guido spawns a local subprocess (`npx`, `uvx`, Python, any executable) and communicates via stdin/stdout.
-- **HTTP+SSE** — Guido connects to a remote MCP server over HTTP. Requests go out as POST; responses arrive over a persistent Server-Sent Events stream.
+- **HTTP+SSE** — Remote MCP server using the 2024-11-05 spec. A persistent `GET /sse` stream receives responses; individual POSTs send requests.
+- **Streamable HTTP** — Remote MCP server using the newer 2025-03-26 spec. A single POST endpoint handles everything (no persistent connection). Auto-detected when a server returns HTTP 405 to the SSE probe.
+
+You never need to specify which remote protocol a server uses — Guido probes SSE first and falls back to Streamable HTTP automatically.
 
 ### Setup
 
@@ -400,12 +405,17 @@ mcp_servers:
     command: python3
     args: ["/path/to/test-mcp-server.py"]
 
-  # Remote HTTP+SSE server
+  # Remote server — HTTP+SSE or Streamable HTTP, auto-detected
   - name: my-remote
     enabled: true
     url: "https://mcp.example.com"
     headers:
       Authorization: "Bearer ${MY_API_TOKEN}"   # optional auth
+
+  # gitmcp.io — turns any public GitHub repo into an MCP server (Streamable HTTP)
+  - name: gitmcp
+    enabled: true
+    url: "https://gitmcp.io/owner/repo"
 ```
 
 When both `url` and `command` are set, `url` takes precedence. `${ENV_VAR}` references in `url`, `args`, `env`, and `headers` values are expanded at startup.
@@ -496,17 +506,18 @@ lib/cli/
 │   ├── harness/           # Core interfaces, types, and config
 │   ├── backends/          # LLM provider implementations (llamacpp, openai, anthropic, ollama, …)
 │   ├── httpserver/        # HTTP route registration and handlers
-│   ├── tools/             # llama-server lifecycle and built-in tool calling
-│   ├── mcp/               # MCP client (connects to external MCP servers)
+│   ├── tools/             # llama-server lifecycle, built-in tool calling, and embedded extraction
+│   ├── embeddedtools/     # Go embed staging — populated by make stage-embed, gitignored
+│   ├── mcp/               # MCP client (stdio, HTTP+SSE, Streamable HTTP transports)
 │   └── cmd/
 │       ├── cli/main.go    # guido CLI (complete, chat, serve, models)
 │       └── harness/main.go # guido-harness (HTTP-only server)
 │
 ├── exec/                  # Runtime artifacts
-│   ├── bin/               # Compiled binaries and embedded llama.cpp tools
-│   │   ├── guido          # Main binary (after make build)
+│   ├── bin/               # Compiled binaries and llama.cpp tools
+│   │   ├── guido          # Main binary (after make build — tools embedded inside)
 │   │   ├── guido-harness  # HTTP-only server binary
-│   │   └── llama-cpp-tools/
+│   │   └── llama-cpp-tools/ # Source for embedding; also used directly in dev
 │   └── scripts/           # Build scripts
 │       ├── build-llama.sh
 │       └── create-py-wrappers.sh
@@ -590,6 +601,15 @@ pkill -f 'llama-server.*8002'
 guido --config /path/to/config.yaml complete "hello"
 ```
 Default config path: `~/.guido/config/config.yaml`
+
+**Remote MCP server not connecting / HTTP 405**
+Guido auto-detects whether a remote server uses the older HTTP+SSE protocol or the newer Streamable HTTP protocol. If you see a 405 warning followed by a successful connection, that's expected — the server uses Streamable HTTP and the fallback worked. If it says `connect failed`, check the URL.
+
+**Force re-extraction of embedded tools**
+```bash
+rm -rf ~/.guido/tools
+guido models   # extracts fresh on next run
+```
 
 **Build errors**
 ```bash

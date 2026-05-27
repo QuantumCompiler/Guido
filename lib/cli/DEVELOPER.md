@@ -8,9 +8,10 @@ This document describes the layout of the `lib/cli` directory and what each file
 
 ```
 lib/cli/
-├── Makefile            — Build orchestration (build, install, clean, test)
+├── Makefile            — Build orchestration (build, install, clean, test, build-embedded, …)
 ├── README.md           — User-facing documentation
 ├── DEVELOPER.md        — This file
+├── .gitignore          — Excludes generated binaries and embed staging area
 ├── config.yaml         — Sample / template configuration (copied to ~/.guido/config/ on install)
 ├── test-mcp-server.py  — Built-in MCP test server (get_time, calculate, read_file, echo)
 ├── go.mod              — Go module definition (module: guido/lib/cli)
@@ -20,17 +21,18 @@ lib/cli/
 │   ├── harness/        — Core abstraction layer (interfaces, types, config)
 │   ├── backends/       — LLM provider implementations
 │   ├── httpserver/     — HTTP server layer
-│   ├── tools/          — llama-server lifecycle + built-in tool calling
-│   ├── mcp/            — MCP client (connect to external MCP servers, expose their tools)
+│   ├── tools/          — llama-server lifecycle, built-in tool calling, embedded extraction
+│   ├── embeddedtools/  — //go:embed staging package (data/ populated by make stage-embed; gitignored)
+│   ├── mcp/            — MCP client (stdio, HTTP+SSE, Streamable HTTP transports)
 │   └── cmd/            — Binary entry points
 │       ├── cli/        — guido CLI binary
 │       └── harness/    — guido-harness HTTP-only server binary
 │
 ├── exec/               — Runtime artifacts
-│   ├── bin/            — Compiled binaries and embedded llama.cpp tools
-│   │   ├── guido            — Main CLI binary (after make build)
-│   │   ├── guido-harness    — HTTP-only server binary (after make build)
-│   │   └── llama-cpp-tools/ — Compiled llama.cpp executables + Python wrappers
+│   ├── bin/            — Compiled binaries and llama.cpp tools
+│   │   ├── guido            — Self-contained CLI binary with tools embedded (after make build)
+│   │   ├── guido-harness    — Self-contained HTTP server binary (after make build)
+│   │   └── llama-cpp-tools/ — Compiled llama.cpp executables (source for embedding; used directly in dev)
 │   └── scripts/        — Build scripts
 │       ├── build-llama.sh          — Compiles llama.cpp and copies tools to exec/bin/llama-cpp-tools/
 │       └── create-py-wrappers.sh   — Generates shell wrappers for llama.cpp Python scripts
@@ -70,6 +72,16 @@ type LLMProvider interface {
 type StatusReporter interface {
     ModelStatus() ModelStatusInfo
 }
+
+// Backends that embed tool calls inside the text stream (llamacpp system-prompt
+// injection) implement this. The CLI agentic loop uses it to decide whether to
+// take the streaming lookahead path for the final answer turn.
+type InTextToolCaller interface {
+    UsesInTextToolCalls() bool
+}
+```
+
+`Harness.UsesInTextToolCalls(model string) bool` routes to the provider and returns false if it doesn't implement `InTextToolCaller`.
 ```
 
 ### Routing
@@ -120,6 +132,10 @@ llama-server has a known bug in some versions where it returns HTTP 500 when a r
 
 This approach is backend-transparent — `LazyLlamaCppBackend` delegates to `LlamaCppBackend.Chat()` so it picks up the fix automatically.
 
+**Streaming counterpart:** `streamChatWithToolPrompt()` applies the same message rewriting but calls llama-server with `"stream": true` and returns a `<-chan string` of raw tokens. This enables the CLI to stream the final answer to the terminal token-by-token. `StreamChat()` routes to it automatically when `req.Tools` is non-empty.
+
+**Exported parser:** `ParseToolCalls(text string) []harness.ToolCall` wraps the internal `parseToolCalls` regex, allowing the CLI streaming loop to detect tool calls after buffering the full token stream without importing internal symbols.
+
 ---
 
 ## `src/httpserver/` — HTTP server
@@ -162,13 +178,38 @@ func Serve(ctx context.Context, cfg *harness.Config, h *harness.Harness, tc *Too
 
 ---
 
-## `src/tools/` — llama-server lifecycle and built-in tool calling
+## `src/tools/` — llama-server lifecycle, built-in tool calling, embedded extraction
 
 | File | Purpose |
 |------|---------|
-| `manager.go` | `Manager` — locates `llama-server` in `exec/bin/llama-cpp-tools/`, starts it as a subprocess (`StartLlamaServer`), waits for it to become healthy, and stops it on `Close()`. Accepts optional `mmProjPath` for vision models |
+| `manager.go` | `Manager` — locates `llama-server`, starts it as a subprocess (`StartLlamaServer`), waits for it to become healthy, stops it on `Close()`. Has an optional `libDir` field: when set (embedded build), `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH` is injected into the subprocess environment so the extracted dylibs are found at runtime |
+| `extract.go` | `ExtractEmbedded(fs embed.FS, targetDir string)` — extracts the embedded tools from `embeddedtools.ToolsFS` to `~/.guido/tools/`. Version-stamped: if `targetDir/.version` already matches the build stamp, extraction is skipped. Returns `nil, nil` in stub (non-embedded) builds so the caller can fall through to the filesystem fallback |
 | `toolcall.go` | `ExecuteTool(name, argsJSON)` — dispatches built-in tool calls from the model (`web_search`, `fetch_url`) to their implementations. MCP tool calls are routed through `mcp.Registry` before this is called |
 | `web.go` | `WebTools()` returns the tool schemas for `web_search` and `fetch_url`. Implementations: DuckDuckGo search and plain-text URL fetching |
+
+### Tools resolution order
+
+Both CLI binaries resolve the tools directory at startup:
+
+1. `$GUIDO_TOOLS_DIR` — explicit override, useful for development or CI
+2. `exec/bin/llama-cpp-tools` relative to CWD — the standard dev layout when running from the project root
+3. `llama-cpp-tools/` adjacent to the binary — works for symlinked installs
+4. Embedded extraction — `tools.ExtractEmbedded(embeddedtools.ToolsFS, "~/.guido/tools/")` — active only in binaries built with `-tags embed_tools`; no-op in regular builds
+
+### Embedded dylibs and rpath
+
+On macOS, the `llama-server` binary is dynamically linked against `@rpath/libllama.0.dylib` and several other llama.cpp / ggml shared libraries. The rpath baked at compile time points at the original build directory. When tools are extracted to `~/.guido/tools/`, those dylibs live in `~/.guido/tools/lib/`. `Manager` handles this by setting `DYLD_LIBRARY_PATH` (macOS) or `LD_LIBRARY_PATH` (Linux) to `libDir` when spawning llama-server — no binary patching required.
+
+---
+
+## `src/embeddedtools/` — embed staging package
+
+| File | Purpose |
+|------|---------|
+| `fs_embedded.go` | Build tag `embed_tools` — declares `//go:embed all:data` and exports `var ToolsFS embed.FS`. Active only in `make build-embedded` builds. The `all:` prefix is required to include the hidden `.version` stamp file |
+| `fs_stub.go` | Build tag `!embed_tools` (all regular builds) — exports a zero-value `embed.FS`. `tools.ExtractEmbedded` detects this and returns `nil, nil`, letting the CLI fall through to filesystem lookup |
+
+The `data/` directory inside this package is populated by `make stage-embed` and is listed in `.gitignore`. It is never committed.
 
 ---
 
@@ -180,9 +221,10 @@ Connects to external [Model Context Protocol](https://modelcontextprotocol.io) s
 |------|---------|
 | `types.go` | JSON-RPC 2.0 wire types (`Request`, `Notification`, `Response`, `IncomingMessage`, `RPCError`) and MCP-specific payloads (`InitializeParams/Result`, `ToolsListResult`, `MCPTool`, `ToolCallParams`, `ToolCallResult`, `ToolContent`) |
 | `transport.go` | `Transport` interface + `StdioTransport` — spawns a subprocess, pipes stdin/stdout, forwards stderr. 1 MB read buffer for large tool-list responses. Write-side mutex for thread safety |
-| `transport_sse.go` | `SSETransport` — connects to a remote MCP server via HTTP+SSE (protocol version 2024-11-05). A persistent `GET /sse` stream receives JSON-RPC responses; individual `POST` requests send messages. The session POST URL is discovered from the first `endpoint` SSE event |
+| `transport_sse.go` | `SSETransport` — MCP spec 2024-11-05. A persistent `GET /sse` stream receives JSON-RPC responses; individual POST requests send messages. Session POST URL discovered from the first `endpoint` SSE event. Exports `ErrMethodNotAllowed` sentinel when the server returns HTTP 405 |
+| `transport_streamable.go` | `StreamableTransport` — MCP spec 2025-03-26. Each `Send()` fires a POST to the MCP endpoint; the response (JSON or SSE body) is read in a background goroutine and forwarded to `recvCh`. Captures `Mcp-Session-Id` for session affinity. No persistent connection required |
 | `client.go` | `Client` — single server connection. Background `readLoop` goroutine demultiplexes responses via `pending map[int64]chan Response`. `initialize()` performs the MCP handshake. `loadTools()` fetches `tools/list` and caches results as namespaced `harness.Tool` values |
-| `registry.go` | `Registry` — multi-server manager. `NewRegistry` selects the transport (SSE when `url` is set, stdio when `command` is set), connects best-effort, and skips failures. `Tools()` returns the aggregated tool list. `ExecuteTool` returns `(result, handled, err)` — `handled=false` lets the caller fall through to built-in tools |
+| `registry.go` | `Registry` — multi-server manager. `NewRegistry` selects the transport automatically, connects best-effort, skips failures. `Tools()` returns the aggregated tool list. `ExecuteTool` returns `(result, handled, err)` — `handled=false` lets the caller fall through to built-in tools |
 
 ### Transport selection
 
@@ -194,29 +236,53 @@ Connects to external [Model Context Protocol](https://modelcontextprotocol.io) s
   command: python3
   args: ["/path/to/server.py"]
 
-# HTTP+SSE (remote)
+# Remote — HTTP+SSE or Streamable HTTP, auto-detected
 - name: remote
   url: "https://mcp.example.com"
   headers:
     Authorization: "Bearer ${TOKEN}"
 ```
 
-`NewRegistry` picks the transport by checking `srv.URL` first, then `srv.Command`. Both cannot be active simultaneously — `url` takes precedence.
+`NewRegistry` selects the transport:
+- `srv.Command` set → `StdioTransport`
+- `srv.URL` set → tries `SSETransport`; if server returns HTTP 405, falls back to `StreamableTransport`
+- Both set → `url` takes precedence
 
-### HTTP+SSE transport protocol
+The 405 fallback is implemented via the `ErrMethodNotAllowed` sentinel exported from `transport_sse.go`:
+
+```go
+transport, err = NewSSETransport(ctx, srv.URL, srv.Headers)
+if errors.Is(err, ErrMethodNotAllowed) {
+    transport, err = NewStreamableTransport(ctx, srv.URL, srv.Headers)
+}
+```
+
+### HTTP+SSE transport protocol (2024-11-05)
+
+```
+Client                              Server
+  │                                   │
+  ├─── GET /sse ──────────────────────►│  persistent SSE stream
+  │◄── event: endpoint ───────────────┤  data: /messages?sessionId=abc
+  │                                   │
+  ├─── POST /messages?sessionId=abc ──►│  each JSON-RPC request
+  │◄── event: message ────────────────┤  data: {"jsonrpc":"2.0","id":1,"result":{...}}
+```
+
+`SSETransport.Close()` cancels the GET context, which unblocks `readSSE` via Go's `net/http` context propagation.
+
+### Streamable HTTP transport protocol (2025-03-26)
 
 ```
 Client                          Server
   │                               │
-  ├─── GET /sse ──────────────────►│  (persistent SSE stream)
-  │                               │
-  │◄── event: endpoint ───────────┤  data: /messages?sessionId=abc
-  │                               │
-  ├─── POST /messages?sessionId=abc ►│  (each JSON-RPC request)
-  │◄── event: message ────────────┤  data: {"jsonrpc":"2.0","id":1,"result":{...}}
+  ├─── POST <url> ────────────────►│  JSON-RPC request body
+  │◄── application/json ──────────┤  single response (or 202 for notifications)
+  │       — or —                  │
+  │◄── text/event-stream ─────────┤  streaming response (tool results, long outputs)
 ```
 
-`SSETransport.Close()` cancels the context on the `GET` connection, which unblocks the background `readSSE` goroutine cleanly via Go's `net/http` context propagation.
+Each POST is independent. `Send()` fires the request and spawns a goroutine to read the response; `Recv()` blocks on the shared channel. The `readLoop` in `Client` is unaware of which transport is underneath.
 
 ### Tool namespacing
 
@@ -273,7 +339,9 @@ All three active commands accept the same three mutually exclusive flags (enforc
 | `resolveToolMode()` | Reads `flagSearch`, `flagMCP`, `flagNative` and returns `(useWeb, useMCP bool)` |
 | `setupTools(ctx, cfg, useWeb, useMCP)` | Connects to MCP servers (if `useMCP` and config has entries), calls `mcp.NewRegistry`, appends web tools and MCP tools to `activeTools`. Returns `([]harness.Tool, *mcp.Registry)` |
 | `dispatchTool(ctx, tc, mcpReg)` | Executes one `harness.ToolCall` — tries `mcpReg.ExecuteTool` first, falls through to `tools.ExecuteTool` for built-ins |
-| `runAgenticLoop(ctx, h, history, model, temp, maxTokens, tools, mcpReg, printProgress)` | Drives the model→tool→model cycle. Appends each turn to `*history` in place. Prints `[tool] ...` / `[searching] ...` / `[fetching] ...` progress lines when `printProgress` is true. Returns the final assistant text |
+| `runAgenticLoop(ctx, h, history, model, temp, maxTokens, tools, mcpReg, printProgress)` | Drives the model→tool→model cycle. Selects streaming or non-streaming inner loop based on `h.UsesInTextToolCalls(model)`. Appends each turn to `*history` in place. Returns the final assistant text |
+| `streamingAgenticTurn(ctx, h, req, printProgress)` | Streaming turn for llamacpp backends. Opens `h.StreamChat`, buffers up to 10 non-whitespace chars to distinguish `TOOL_CALL:` responses (silent) from content responses (flushed + streamed live). Returns `(text, toolCalls, err)` |
+| `dispatchToolCalls(ctx, calls, history, mcpReg, printProgress)` | Executes every `harness.ToolCall` in a slice, prints progress, and appends tool-result messages to `*history` |
 | `filterBackends(cfg, target, all)` | Restricts `cfg.Backends` to a single backend before initialization |
 | `initializeBackends(h, cfg, tm, lazy)` | Instantiates and registers all backends in the (filtered) config. `lazy=true` wraps embedded llamacpp backends in `LazyLlamaCppBackend` |
 | `buildMessageContent(text, contexts, files, images)` | Assembles a `MessageContent` from CLI flags (`--context`, `--file`, `--image`) |
@@ -282,7 +350,21 @@ All three active commands accept the same three mutually exclusive flags (enforc
 
 `runAgenticLoop` is called by both `complete` and `chat` whenever `len(activeTools) > 0`. It is also mirrored inside `httpserver.Handler.runToolLoop` for the `serve` case.
 
-Tool dispatch order:
+**Streaming path (llamacpp):** When `h.UsesInTextToolCalls(model)` returns true (i.e. the backend satisfies `harness.InTextToolCaller`), each turn uses `streamingAgenticTurn`:
+
+```
+model turn (StreamChat)
+  ├─ first ≥10 non-whitespace chars start with "TOOL_CALL:" ?
+  │     YES → buffer silently, parse tool calls, loop
+  │     NO  → flush buffer, stream remaining tokens live, done
+  └─ short response (< lookahead) → treated as content
+```
+
+The 10-character lookahead is enough to distinguish `TOOL_CALL:` (10 chars) from any content response without noticeable latency.
+
+**Non-streaming path (OpenAI, Anthropic):** `h.Chat()` is called; if `resp.Message.ToolCalls` is non-empty the loop continues, otherwise the final text is printed and returned.
+
+**Tool dispatch order (both paths):**
 1. `mcp.Registry.ExecuteTool` — handles `mcp__<server>__<tool>` names
 2. `tools.ExecuteTool` — handles built-in names (`web_search`, `fetch_url`)
 
@@ -315,15 +397,24 @@ Git submodule pinned to `github.com/ggml-org/llama.cpp`. The Go code does not im
 ## Build system
 
 ```
-make build          # build-llama + build-go
-make build-llama    # cmake build of llama.cpp → exec/bin/llama-cpp-tools/
-make build-go       # go build → exec/bin/guido + exec/bin/guido-harness
-make install        # build + copy binary to ~/bin/ + config to ~/.guido/config/ + /usr/local/bin symlinks
-make symlinks       # (re)create /usr/local/bin symlinks only
-make clean          # remove exec/bin/ and modules/llama.cpp/build/
-make test           # go test ./src/...
-make dev-build      # go build only (fast, skips llama.cpp)
+make build           # full build: build-llama → stage-embed → build-embedded (self-contained binary)
+make build-llama     # cmake build of llama.cpp → exec/bin/llama-cpp-tools/
+make stage-embed     # copy executables + dylibs into src/embeddedtools/data/, write .version stamp
+make build-embedded  # stage-embed + go build -tags embed_tools → self-contained binary (~34 MB)
+make build-go        # go build (no embed tag) — fast dev build, finds tools on filesystem
+make dev-build       # alias for build-go
+make install         # build + copy config to ~/.guido/config/ + /usr/local/bin symlinks
+make symlinks        # (re)create /usr/local/bin symlinks only
+make clean           # remove exec/bin/ and modules/llama.cpp/build/
+make test            # go test ./src/...
 ```
+
+**When to use each:**
+- `make build` — distribution builds; produces a binary you can copy anywhere
+- `make build-go` / `make dev-build` — everyday development; fast, no re-embedding
+- `make stage-embed` alone — after `make build-llama`, if you want to inspect what gets embedded before building
+
+The `src/embeddedtools/data/` directory is listed in `.gitignore` and should never be committed.
 
 The `go.mod` module root is `lib/cli`, so all import paths are prefixed `guido/lib/cli/src/`:
 
@@ -355,9 +446,10 @@ import (
 ## Adding a new MCP transport
 
 1. Implement the `mcp.Transport` interface in a new file `src/mcp/transport_<name>.go`
-2. Add a constructor (`NewSSETransport`, etc.) that returns a `*YourTransport`
-3. In `mcp.Registry.NewRegistry`, select the transport based on whether `MCPServerConfig.URL` or `MCPServerConfig.Command` is set
-4. No changes needed to `Client` or `Registry` — they operate on the `Transport` interface
+2. Add a constructor that returns `(*YourTransport, error)`
+3. If the new transport is a fallback for an existing one (like Streamable HTTP is for SSE), export a sentinel error from the existing transport and check `errors.Is` in `registry.go`
+4. Otherwise, add a field to `MCPServerConfig` in `harness/models.go` and dispatch in `NewRegistry` based on that field
+5. No changes needed to `Client` — it operates on the `Transport` interface and is transport-agnostic
 
 ## Adding a new built-in tool
 
