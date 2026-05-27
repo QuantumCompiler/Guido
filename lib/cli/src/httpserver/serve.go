@@ -16,6 +16,24 @@ import (
 	"guido/lib/cli/src/harness"
 )
 
+// corsMiddleware adds permissive CORS headers to every response.
+// Guido is a local-inference server typically accessed from localhost; the
+// open CORS policy lets browser-based frontends and Electron UIs call it
+// without proxy workarounds.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Guido-Tools-Used, X-Guido-Resolved-Model")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Serve starts the OpenAI-compatible HTTP server on the port in cfg, registers
 // all routes, and blocks until SIGINT/SIGTERM or ctx is cancelled.
 // tc may be nil — when non-nil the handler runs the agentic tool loop
@@ -26,6 +44,7 @@ func Serve(ctx context.Context, cfg *harness.Config, h *harness.Harness, tc *Too
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
+	r.Use(corsMiddleware)
 
 	hnd := NewHandler(h, tc)
 	r.Post("/v1/completions", hnd.HandleCompletion)

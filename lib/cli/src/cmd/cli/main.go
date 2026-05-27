@@ -49,6 +49,12 @@ var (
 	allBackends      bool   // --all-backends: initialize every configured backend (complete/chat)
 	serveModel       string // --model: which backend to serve (default: config default)
 	serveAllBackends bool   // --all-backends: serve every configured backend
+
+	// Default fallback values for embedded llamacpp backends that don't specify
+	// port / gpu_layers in their config entry. Used by initializeBackends and
+	// overridable from the harness subcommand flags.
+	llamaPort int = 8000 // starting port for auto-assigned embedded backends
+	llamaGPU  int = 99   // GPU layers when backend config omits gpu_layers
 )
 
 var rootCmd = &cobra.Command{
@@ -429,6 +435,57 @@ will be terminated automatically.`,
 		}
 
 		if err := httpserver.Serve(ctx, cfg, h, tc, func() {
+			if err := toolMgr.Close(); err != nil {
+				log.Printf("Backend cleanup error: %v", err)
+			}
+		}); err != nil {
+			log.Fatalf("Server error: %v", err)
+		}
+	},
+}
+
+// harnessCmd is the embedded replacement for the former guido-harness binary.
+// It starts a bare OpenAI-compatible HTTP server with ALL configured backends
+// and no tool injection — intended for GUI applications that embed guido and
+// manage the process lifetime themselves.
+//
+// Accepts --llama-port and --llama-gpu-layers to override the defaults used for
+// embedded llamacpp backends that don't specify port / gpu_layers in config.
+var harnessCmd = &cobra.Command{
+	Use:   "harness",
+	Short: "Start the bare HTTP harness server (all backends, no tool injection)",
+	Long: `Starts an OpenAI-compatible HTTP server that exposes every backend
+configured in config.yaml. All embedded llamacpp backends use lazy loading —
+the llama-server process starts on the first request and can optionally unload
+after the configured idle_timeout_seconds.
+
+Unlike 'serve', this command does not inject tools into the model — it is
+intended as an embedding target for GUI applications that wrap guido and handle
+tool calling at a higher level.
+
+Endpoints:
+  POST /v1/completions
+  POST /v1/chat/completions
+  GET  /v1/models
+  GET  /v1/model/status
+  GET  /health`,
+	Run: func(cmd *cobra.Command, args []string) {
+		cfg, err := harness.LoadConfig(configPath)
+		if err != nil {
+			log.Fatalf("Failed to load config: %v", err)
+		}
+
+		h := harness.NewHarness(cfg)
+		// Always lazy: llama-server starts on the first request.
+		providers := initializeBackends(h, cfg, toolMgr, true)
+		if len(providers) == 0 {
+			log.Fatal("No backends configured. Set up at least one backend in config.")
+		}
+		h.SetRouter(harness.NewSimpleRouter(cfg, providers))
+
+		log.Printf("[guido] harness mode — %d backend(s), models load on first request", len(providers))
+
+		if err := httpserver.Serve(context.Background(), cfg, h, nil, func() {
 			if err := toolMgr.Close(); err != nil {
 				log.Printf("Backend cleanup error: %v", err)
 			}
@@ -824,7 +881,7 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 			if bcfg.URL == "embedded" || bcfg.URL == "" {
 				port := bcfg.Port
 				if port == 0 {
-					port = nextEmbeddedPort(usedPorts, 8000)
+					port = nextEmbeddedPort(usedPorts, llamaPort)
 				}
 				usedPorts[port] = true
 				llamacppURL = fmt.Sprintf("http://localhost:%d", port)
@@ -839,7 +896,7 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 					// unloads after idleTimeout seconds of inactivity.
 					gpuLayers := bcfg.GPULayers
 					if gpuLayers == 0 {
-						gpuLayers = 99
+						gpuLayers = llamaGPU
 					}
 					idleTimeout := time.Duration(bcfg.IdleTimeoutSeconds) * time.Second
 					lb := backends.NewLazyLlamaCppBackend(
@@ -871,7 +928,7 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 					if tm != nil && expandedModelPath != "" {
 						gpuLayers := bcfg.GPULayers
 						if gpuLayers == 0 {
-							gpuLayers = 99
+							gpuLayers = llamaGPU
 						}
 						_, err := tm.StartLlamaServer(expandedModelPath, port, gpuLayers, bcfg.ChatTemplate, expandedMmProjPath)
 						if err != nil {
@@ -951,6 +1008,9 @@ func init() {
 	serveCmd.Flags().StringVarP(&serveModel, "model", "m", "", "Backend to serve (default: models.default from config)")
 	serveCmd.Flags().BoolVar(&serveAllBackends, "all-backends", false, "Serve every configured backend instead of just the default")
 
+	harnessCmd.Flags().IntVar(&llamaPort, "llama-port", 8000, "Starting port for embedded llamacpp backends with no explicit port in config")
+	harnessCmd.Flags().IntVar(&llamaGPU, "llama-gpu-layers", 99, "Default GPU layers for embedded llamacpp backends with no explicit gpu_layers in config")
+
 	// Tool mode flags — identical on chat, complete, and serve.
 	// At most one may be set per invocation (Cobra enforces the mutual exclusion).
 	// No flag → all available tools are active (web search + any configured MCP servers).
@@ -964,6 +1024,7 @@ func init() {
 	rootCmd.AddCommand(completeCmd)
 	rootCmd.AddCommand(chatCmd)
 	rootCmd.AddCommand(serveCmd)
+	rootCmd.AddCommand(harnessCmd)
 	rootCmd.AddCommand(modelsCmd)
 }
 

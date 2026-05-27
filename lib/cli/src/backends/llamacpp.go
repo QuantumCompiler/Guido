@@ -22,23 +22,6 @@ type LlamaCppBackend struct {
 	client  *http.Client
 }
 
-// llamaCppCompletionRequest is the request format for llama.cpp API
-type llamaCppCompletionRequest struct {
-	Prompt      string   `json:"prompt"`
-	Temperature float32  `json:"temperature"`
-	NPredict    int      `json:"n_predict"`
-	Stream      bool     `json:"stream"`
-	Stop        []string `json:"stop,omitempty"`
-}
-
-// llamaCppCompletionResponse is the response format from llama.cpp API
-type llamaCppCompletionResponse struct {
-	Content    string `json:"content"`
-	Stop       bool   `json:"stop"`
-	StopReason string `json:"stop_reason"`
-	Tokens     int    `json:"tokens_evaluated"`
-}
-
 // UsesInTextToolCalls implements harness.InTextToolCaller.
 // llamacpp uses system-prompt injection: tool calls appear as TOOL_CALL: lines
 // in the text stream, making streaming with lookahead detection possible.
@@ -55,114 +38,42 @@ func NewLlamaCppBackend(baseURL, model string) *LlamaCppBackend {
 	}
 }
 
-// Complete implements harness.LLMProvider
+// Complete implements harness.LLMProvider.
+// Wraps the prompt as a user message and delegates to /v1/chat/completions —
+// the stable OpenAI-compatible endpoint. The legacy /completion endpoint was
+// removed or made unreliable in newer llama-server builds.
 func (lcb *LlamaCppBackend) Complete(ctx context.Context, req *harness.CompletionRequest) (*harness.CompletionResponse, error) {
-	llmReq := llamaCppCompletionRequest{
-		Prompt:      req.Prompt,
+	chatResp, err := lcb.Chat(ctx, &harness.ChatRequest{
+		Messages: []harness.ChatMessage{
+			{Role: "user", Content: harness.Text(req.Prompt)},
+		},
 		Temperature: req.Temperature,
-		NPredict:    req.MaxTokens,
-		Stream:      false,
-		Stop:        defaultStopSequences,
-	}
-
-	body, err := json.Marshal(llmReq)
+		MaxTokens:   req.MaxTokens,
+		Model:       lcb.model,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, err
 	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/completion", lcb.baseURL), bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	resp, err := lcb.client.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("llama.cpp returned status %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var llmResp llamaCppCompletionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
 	return &harness.CompletionResponse{
-		Text:         llmResp.Content,
-		FinishReason: llmResp.StopReason,
-		TokensUsed:   llmResp.Tokens,
-		Model:        lcb.model,
+		Text:         chatResp.Message.Content.PlainText(),
+		FinishReason: chatResp.FinishReason,
+		TokensUsed:   chatResp.TokensUsed,
+		Model:        chatResp.Model,
 	}, nil
 }
 
-// StreamTokens implements harness.LLMProvider
+// StreamTokens implements harness.LLMProvider.
+// Wraps the prompt as a user message and delegates to StreamChat so both
+// streaming paths share the same /v1/chat/completions SSE logic.
 func (lcb *LlamaCppBackend) StreamTokens(ctx context.Context, req *harness.CompletionRequest) (<-chan string, error) {
-	tokenChan := make(chan string)
-
-	go func() {
-		defer close(tokenChan)
-
-		llmReq := llamaCppCompletionRequest{
-			Prompt:      req.Prompt,
-			Temperature: req.Temperature,
-			NPredict:    req.MaxTokens,
-			Stream:      true,
-			Stop:        defaultStopSequences,
-		}
-
-		body, err := json.Marshal(llmReq)
-		if err != nil {
-			return
-		}
-
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/completion", lcb.baseURL), bytes.NewReader(body))
-		if err != nil {
-			return
-		}
-
-		httpReq.Header.Set("Content-Type", "application/json")
-
-		resp, err := lcb.client.Do(httpReq)
-		if err != nil {
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return
-		}
-
-		decoder := json.NewDecoder(resp.Body)
-		for {
-			var llmResp llamaCppCompletionResponse
-			if err := decoder.Decode(&llmResp); err != nil {
-				if err == io.EOF {
-					break
-				}
-				return
-			}
-
-			if llmResp.Content != "" {
-				select {
-				case tokenChan <- llmResp.Content:
-				case <-ctx.Done():
-					return
-				}
-			}
-
-			if llmResp.Stop {
-				break
-			}
-		}
-	}()
-
-	return tokenChan, nil
+	return lcb.StreamChat(ctx, &harness.ChatRequest{
+		Messages: []harness.ChatMessage{
+			{Role: "user", Content: harness.Text(req.Prompt)},
+		},
+		Temperature: req.Temperature,
+		MaxTokens:   req.MaxTokens,
+		Model:       lcb.model,
+	})
 }
 
 // llamaCppChatRequest is the OpenAI-compatible chat request format for llama-server
@@ -246,6 +157,7 @@ func (lcb *LlamaCppBackend) Chat(ctx context.Context, req *harness.ChatRequest) 
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
 			CompletionTokens int `json:"completion_tokens"`
 		} `json:"usage"`
 	}
@@ -262,6 +174,7 @@ func (lcb *LlamaCppBackend) Chat(ctx context.Context, req *harness.ChatRequest) 
 			Content: result.Choices[0].Message.Content,
 		},
 		FinishReason: result.Choices[0].FinishReason,
+		PromptTokens: result.Usage.PromptTokens,
 		TokensUsed:   result.Usage.CompletionTokens,
 		Model:        lcb.model,
 	}, nil
@@ -417,6 +330,7 @@ func (lcb *LlamaCppBackend) chatWithToolPrompt(ctx context.Context, req *harness
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
 			CompletionTokens int `json:"completion_tokens"`
 		} `json:"usage"`
 	}
@@ -436,6 +350,7 @@ func (lcb *LlamaCppBackend) chatWithToolPrompt(ctx context.Context, req *harness
 				ToolCalls: toolCalls,
 			},
 			FinishReason: "tool_calls",
+			PromptTokens: result.Usage.PromptTokens,
 			TokensUsed:   result.Usage.CompletionTokens,
 			Model:        lcb.model,
 		}, nil
@@ -447,6 +362,7 @@ func (lcb *LlamaCppBackend) chatWithToolPrompt(ctx context.Context, req *harness
 			Content: result.Choices[0].Message.Content,
 		},
 		FinishReason: result.Choices[0].FinishReason,
+		PromptTokens: result.Usage.PromptTokens,
 		TokensUsed:   result.Usage.CompletionTokens,
 		Model:        lcb.model,
 	}, nil

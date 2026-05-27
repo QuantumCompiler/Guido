@@ -141,6 +141,13 @@ func (h *Harness) ModelStatus(backendName string) (ModelStatusInfo, bool) {
 	return sr.ModelStatus(), true
 }
 
+// DefaultModel returns the default model name from config (models.default).
+// Used by HTTP handlers to flag the default in /v1/models responses and to
+// resolve requests where the client omits the "model" field.
+func (h *Harness) DefaultModel() string {
+	return h.config.Models.Default
+}
+
 // AllModelStatuses returns status for every backend that implements StatusReporter.
 func (h *Harness) AllModelStatuses() map[string]ModelStatusInfo {
 	result := make(map[string]ModelStatusInfo)

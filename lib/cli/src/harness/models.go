@@ -56,7 +56,8 @@ type ChatRequest struct {
 type ChatResponse struct {
 	Message      ChatMessage `json:"message"`
 	FinishReason string      `json:"finish_reason"`
-	TokensUsed   int         `json:"tokens_used"`
+	PromptTokens int         `json:"prompt_tokens"`  // input tokens used (0 if unavailable)
+	TokensUsed   int         `json:"tokens_used"`    // completion tokens generated
 	Model        string      `json:"model"`
 }
 

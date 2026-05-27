@@ -86,7 +86,6 @@ backends:
     model: "test-model"
 
 mcp_servers:
-  # ── Local server (stdio subprocess) ──────────────────────────────────────────
   - name: devtools
     enabled: true
     command: python3

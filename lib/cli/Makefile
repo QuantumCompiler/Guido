@@ -48,7 +48,7 @@ help:
 	@echo "Targets:"
 	@echo "  build           Build everything — llama.cpp tools + self-contained embedded binary"
 	@echo "  build-llama     Build only llama.cpp tools"
-	@echo "  build-go        Build only Go binaries (requires build-llama first)"
+	@echo "  build-go        Build only Go binary (requires build-llama first)"
 	@echo "  stage-embed     Copy compiled tools into src/embeddedtools/data/ for embedding"
 	@echo "  build-embedded  stage-embed + build self-contained binary (-tags embed_tools)"
 	@echo "  clean           Clean build artifacts"
@@ -72,9 +72,8 @@ build-llama:
 build-go:
 	@echo "Building Go binaries..."
 	@mkdir -p $(BIN_DIR)
-	@go build -o $(BIN_DIR)/guido-harness ./src/cmd/harness
-	@go build -o $(BIN_DIR)/guido         ./src/cmd/cli
-	@echo "✓ Go binaries built: $(BIN_DIR)/guido-{harness,} "
+	@go build -o $(BIN_DIR)/guido ./src/cmd/cli
+	@echo "✓ Go binaries built: $(BIN_DIR)/guido"
 
 # Copy compiled llama.cpp tools into the embed staging directory.
 # Run this after build-llama; it populates src/embeddedtools/data/ which is
@@ -100,14 +99,13 @@ stage-embed:
 	@echo "$(VERSION)-$(OS)-$(ARCH)" > $(EMBED_DIR)/.version
 	@echo "✓ Staged to $(EMBED_DIR)/ (version: $(VERSION)-$(OS)-$(ARCH))"
 
-# Build self-contained binaries with all llama.cpp tools baked in.
+# Build self-contained binary with all llama.cpp tools baked in.
 # Requires build-llama (or an existing LLAMA_TOOLS_DIR) to have run first.
 build-embedded: stage-embed
-	@echo "Building self-contained embedded binaries..."
+	@echo "Building self-contained embedded binary..."
 	@mkdir -p $(BIN_DIR)
-	@go build -tags embed_tools -o $(BIN_DIR)/guido-harness ./src/cmd/harness
-	@go build -tags embed_tools -o $(BIN_DIR)/guido         ./src/cmd/cli
-	@echo "✓ Self-contained binaries built: $(BIN_DIR)/guido-{harness,}"
+	@go build -tags embed_tools -o $(BIN_DIR)/guido ./src/cmd/cli
+	@echo "✓ Self-contained binary built: $(BIN_DIR)/guido"
 	@echo "  (llama.cpp tools are embedded — no external dependencies needed)"
 
 # Install binary, config, and /usr/local/bin symlinks
@@ -127,11 +125,9 @@ install: build
 # Requires sudo — you will be prompted for your password.
 symlinks:
 	@echo "── Symlinks → $(SYMLINK_DIR) ─────────────────────────────"
-	@echo "  Guido binaries:"
-	@sudo ln -sf "$(CURDIR)/$(BIN_DIR)/guido"         "$(SYMLINK_DIR)/guido"
+	@echo "  Guido binary:"
+	@sudo ln -sf "$(CURDIR)/$(BIN_DIR)/guido" "$(SYMLINK_DIR)/guido"
 	@echo "    guido"
-	@sudo ln -sf "$(CURDIR)/$(BIN_DIR)/guido-harness" "$(SYMLINK_DIR)/guido-harness"
-	@echo "    guido-harness"
 	@echo "  llama.cpp tools:"
 	@for tool in "$(CURDIR)/$(LLAMA_TOOLS_DIR)"/*; do \
 		name=$$(basename "$$tool"); \
@@ -142,10 +138,11 @@ symlinks:
 	@echo "✓ Installation complete!"
 	@echo ""
 	@echo "Config:    $(CONFIG_DIR)/config.yaml"
-	@echo "Symlinks:  $(SYMLINK_DIR)/guido, guido-harness, llama-server, ..."
+	@echo "Symlinks:  $(SYMLINK_DIR)/guido, llama-server, ..."
 	@echo ""
 	@echo "To use:"
 	@echo "  guido serve"
+	@echo "  guido harness"
 	@echo "  guido chat"
 
 # Clean build artifacts
@@ -160,7 +157,6 @@ test:
 	@echo "Running tests..."
 	@go test ./src/...
 
-# Fast rebuild of Go binaries only (skips llama.cpp)
+# Fast rebuild of Go binary only (skips llama.cpp)
 dev-build:
-	@go build -o $(BIN_DIR)/guido-harness ./src/cmd/harness
-	@go build -o $(BIN_DIR)/guido         ./src/cmd/cli
+	@go build -o $(BIN_DIR)/guido ./src/cmd/cli

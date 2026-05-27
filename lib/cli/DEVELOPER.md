@@ -24,14 +24,12 @@ lib/cli/
 │   ├── tools/          — llama-server lifecycle, built-in tool calling, embedded extraction
 │   ├── embeddedtools/  — //go:embed staging package (data/ populated by make stage-embed; gitignored)
 │   ├── mcp/            — MCP client (stdio, HTTP+SSE, Streamable HTTP transports)
-│   └── cmd/            — Binary entry points
-│       ├── cli/        — guido CLI binary
-│       └── harness/    — guido-harness HTTP-only server binary
+│   └── cmd/            — Binary entry point
+│       └── cli/        — guido binary (all subcommands: complete, chat, serve, harness, models)
 │
 ├── exec/               — Runtime artifacts
 │   ├── bin/            — Compiled binaries and llama.cpp tools
-│   │   ├── guido            — Self-contained CLI binary with tools embedded (after make build)
-│   │   ├── guido-harness    — Self-contained HTTP server binary (after make build)
+│   │   ├── guido            — Single self-contained binary with tools embedded (after make build)
 │   │   └── llama-cpp-tools/ — Compiled llama.cpp executables (source for embedding; used directly in dev)
 │   └── scripts/        — Build scripts
 │       ├── build-llama.sh          — Compiles llama.cpp and copies tools to exec/bin/llama-cpp-tools/
@@ -82,7 +80,6 @@ type InTextToolCaller interface {
 ```
 
 `Harness.UsesInTextToolCalls(model string) bool` routes to the provider and returns false if it doesn't implement `InTextToolCaller`.
-```
 
 ### Routing
 
@@ -162,7 +159,7 @@ Passed to `NewHandler` and `Serve`. When non-nil, `HandleChat` runs the full too
 func Serve(ctx context.Context, cfg *harness.Config, h *harness.Harness, tc *ToolConfig, onShutdown func()) error
 ```
 
-`tc` is nil in `guido-harness` (the standalone server binary). It is populated by `serveCmd` in `guido` when tool flags are active.
+`tc` is nil in `guido harness` mode (all backends, no tool injection). It is populated by `serveCmd` in `guido serve` when tool flags are active.
 
 ### Endpoints
 
@@ -308,9 +305,9 @@ type Transport interface {
 
 ---
 
-## `src/cmd/cli/` — `guido` CLI binary
+## `src/cmd/cli/` — `guido` binary
 
-Single `main.go` that uses `cobra` to expose four subcommands. All tool-related logic is centralized in package-level helpers so the three commands that support tools (`complete`, `chat`, `serve`) share identical behavior.
+Single `main.go` that uses `cobra` to expose five subcommands. All tool-related logic is centralized in package-level helpers so the three commands that support tools (`complete`, `chat`, `serve`) share identical behavior.
 
 ### Subcommands
 
@@ -319,6 +316,7 @@ Single `main.go` that uses `cobra` to expose four subcommands. All tool-related 
 | `complete <prompt>` | One-shot prompt → response. Runs the agentic loop when tools are active, streams directly when they are not |
 | `chat` | Interactive multi-turn session. Agentic loop when tools active, streaming otherwise |
 | `serve` | Persistent HTTP server with lazy-loading backends. Passes tool config to the HTTP handler |
+| `harness` | Bare HTTP server — all backends, lazy loading, no tool injection. Replacement for the former `guido-harness` binary. Accepts `--llama-port` and `--llama-gpu-layers` to override defaults for embedded backends |
 | `models` | Lists all models from all configured backends |
 
 ### Tool mode flags
@@ -372,11 +370,6 @@ If `Registry.ExecuteTool` returns `handled=false`, the call falls through to ste
 
 ---
 
-## `src/cmd/harness/` — `guido-harness` binary
-
-Minimal HTTP-only server entry point. No `cobra`/CLI flags beyond `-config`, `-llama-port`, `-llama-gpu-layers`. Always uses lazy loading for embedded backends. Passes `nil` for `ToolConfig` to `httpserver.Serve` — tool injection is not supported in the standalone harness binary (use `guido serve` instead). Intended to be embedded in a GUI application that manages the process lifetime directly.
-
----
 
 ## `exec/scripts/`
 
@@ -400,7 +393,7 @@ Git submodule pinned to `github.com/ggml-org/llama.cpp`. The Go code does not im
 make build           # full build: build-llama → stage-embed → build-embedded (self-contained binary)
 make build-llama     # cmake build of llama.cpp → exec/bin/llama-cpp-tools/
 make stage-embed     # copy executables + dylibs into src/embeddedtools/data/, write .version stamp
-make build-embedded  # stage-embed + go build -tags embed_tools → self-contained binary (~34 MB)
+make build-embedded  # stage-embed + go build -tags embed_tools → exec/bin/guido (~34 MB, self-contained)
 make build-go        # go build (no embed tag) — fast dev build, finds tools on filesystem
 make dev-build       # alias for build-go
 make install         # build + copy config to ~/.guido/config/ + /usr/local/bin symlinks
@@ -433,7 +426,7 @@ import (
 ## Adding a new backend
 
 1. Create `src/backends/myprovider.go` with a struct implementing `harness.LLMProvider`
-2. Add a case to `initializeBackends()` in `src/cmd/cli/main.go` (and mirror it in `src/cmd/harness/main.go`)
+2. Add a case to `initializeBackends()` in `src/cmd/cli/main.go`
 3. Add a config entry under `backends:` in `config.yaml`
 4. (Optional) Add fields to `harness.BackendConfig` in `src/harness/models.go` if you need new config keys
 

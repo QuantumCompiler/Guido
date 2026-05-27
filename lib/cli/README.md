@@ -16,7 +16,7 @@ make install  # build + copy config to ~/.guido/config/ + /usr/local/bin symlink
 
 `make build` produces a single self-contained binary at `exec/bin/guido`. The binary has all llama.cpp tools (`llama-server`, `llama-cli`, `llama-quantize`, and shared libraries) baked directly inside using Go's `//go:embed`. On the first run in a new location it silently extracts them to `~/.guido/tools/`; subsequent runs skip extraction.
 
-`make install` places the binary at `~/bin/guido` and writes a starter config to `~/.guido/config/config.yaml` (skipped if the file already exists). It also creates `/usr/local/bin` symlinks for `guido`, `guido-harness`, and every tool in `exec/bin/llama-cpp-tools/`.
+`make install` places the binary at `~/bin/guido` and writes a starter config to `~/.guido/config/config.yaml` (skipped if the file already exists). It also creates `/usr/local/bin` symlinks for `guido` and every tool in `exec/bin/llama-cpp-tools/`.
 
 ### Configure
 
@@ -48,6 +48,7 @@ backends:
 guido complete "Explain Go interfaces in one paragraph"
 guido chat
 guido serve          # OpenAI-compatible HTTP server on port 8080
+guido harness        # bare HTTP server (all backends, no tool injection — for GUI embedding)
 ```
 
 ---
@@ -180,6 +181,39 @@ guido serve --all-backends
 
 ---
 
+### `harness` — bare HTTP server for GUI embedding
+
+```bash
+guido harness [flags]
+```
+
+Starts an OpenAI-compatible HTTP server that exposes **every** configured backend with lazy loading and no tool injection. Intended for GUI applications that embed `guido` as a subprocess and implement tool calling at a higher level — the GUI talks directly to the model via the HTTP API without any agentic wrapping.
+
+Differences from `serve`:
+
+| | `serve` | `harness` |
+|---|---------|-----------|
+| Backends | default (or `--model` / `--all-backends`) | all backends always |
+| Tool injection | yes (MCP + web search) | no |
+| Intended for | direct terminal/API use | GUI embedding |
+
+```bash
+# All backends, default port/GPU settings
+guido harness
+
+# Override starting port and GPU layers for embedded backends
+guido harness --llama-port 9000 --llama-gpu-layers 32
+```
+
+**Flags**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--llama-port` | `8000` | Starting port for embedded backends with no explicit `port:` in config |
+| `--llama-gpu-layers` | `99` | Default GPU layers for embedded backends with no explicit `gpu_layers:` in config |
+
+---
+
 ### `models` — list available models
 
 ```bash
@@ -216,6 +250,7 @@ When running `guido serve`, the server exposes an OpenAI-compatible API on the c
 ### Endpoints
 
 #### `POST /v1/completions`
+
 ```bash
 curl -X POST http://localhost:8080/v1/completions \
   -H "Content-Type: application/json" \
@@ -223,6 +258,7 @@ curl -X POST http://localhost:8080/v1/completions \
 ```
 
 #### `POST /v1/chat/completions`
+
 ```bash
 curl -X POST http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -236,6 +272,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 When `guido serve` is started with tool flags, this endpoint runs the full agentic loop and returns the final answer. The `tool_calls` turns are hidden from the client.
 
 Multimodal messages use the OpenAI content-part format:
+
 ```json
 {
   "model": "my-vision-model",
@@ -250,12 +287,15 @@ Multimodal messages use the OpenAI content-part format:
 ```
 
 #### `GET /v1/models`
+
 ```bash
 curl http://localhost:8080/v1/models
 ```
 
 #### `GET /v1/model/status`
+
 Returns the load state of lazy backends (useful for a GUI loading indicator):
+
 ```bash
 # All backends
 curl http://localhost:8080/v1/model/status
@@ -265,6 +305,7 @@ curl "http://localhost:8080/v1/model/status?backend=my-model"
 ```
 
 Response:
+
 ```json
 {
   "backends": {
@@ -276,6 +317,7 @@ Response:
 States: `unloaded` → `loading` → `ready` → `unloaded` (after idle timeout)
 
 #### `GET /health`
+
 ```bash
 curl http://localhost:8080/health
 ```
@@ -434,6 +476,7 @@ Guido ships with a ready-to-use test MCP server at `lib/cli/test-mcp-server.py`:
 | `echo` | Returns its input unchanged — useful for debugging the tool dispatch loop |
 
 Enable it in config:
+
 ```yaml
 mcp_servers:
   - name: devtools
@@ -443,6 +486,7 @@ mcp_servers:
 ```
 
 Then test with:
+
 ```bash
 guido chat
 You: What time is it right now?
@@ -482,6 +526,7 @@ backends:
 ```
 
 Then from the CLI:
+
 ```bash
 guido complete "Describe what you see" --image photo.jpg
 guido chat --image diagram.png
@@ -510,13 +555,11 @@ lib/cli/
 │   ├── embeddedtools/     # Go embed staging — populated by make stage-embed, gitignored
 │   ├── mcp/               # MCP client (stdio, HTTP+SSE, Streamable HTTP transports)
 │   └── cmd/
-│       ├── cli/main.go    # guido CLI (complete, chat, serve, models)
-│       └── harness/main.go # guido-harness (HTTP-only server)
+│       └── cli/main.go    # guido CLI (complete, chat, serve, harness, models)
 │
 ├── exec/                  # Runtime artifacts
 │   ├── bin/               # Compiled binaries and llama.cpp tools
-│   │   ├── guido          # Main binary (after make build — tools embedded inside)
-│   │   ├── guido-harness  # HTTP-only server binary
+│   │   ├── guido          # Single binary (after make build — tools embedded inside)
 │   │   └── llama-cpp-tools/ # Source for embedding; also used directly in dev
 │   └── scripts/           # Build scripts
 │       ├── build-llama.sh
@@ -572,7 +615,7 @@ type LLMProvider interface {
 }
 ```
 
-Register it in `initializeBackends` in `cmd/cli/main.go` (and mirror in `cmd/harness/main.go`), and add a config entry under `backends:`.
+Register it in `initializeBackends` in `cmd/cli/main.go` and add a config entry under `backends:`.
 
 ---
 
@@ -588,30 +631,37 @@ Register it in `initializeBackends` in `cmd/cli/main.go` (and mirror in `cmd/har
 - Guido works around it automatically via system-prompt injection — no action needed
 
 **Port conflict**
+
 ```
 a llama-server is already running on port 8002 but serves a different model
 ```
+
 Kill the old process and retry:
+
 ```bash
 pkill -f 'llama-server.*8002'
 ```
 
 **Config not found**
+
 ```bash
 guido --config /path/to/config.yaml complete "hello"
 ```
+
 Default config path: `~/.guido/config/config.yaml`
 
 **Remote MCP server not connecting / HTTP 405**
 Guido auto-detects whether a remote server uses the older HTTP+SSE protocol or the newer Streamable HTTP protocol. If you see a 405 warning followed by a successful connection, that's expected — the server uses Streamable HTTP and the fallback worked. If it says `connect failed`, check the URL.
 
 **Force re-extraction of embedded tools**
+
 ```bash
 rm -rf ~/.guido/tools
 guido models   # extracts fresh on next run
 ```
 
 **Build errors**
+
 ```bash
 cd lib/cli
 go mod tidy
