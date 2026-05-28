@@ -1,0 +1,31 @@
+*.DS_STORE
+
+# Build artifacts
+/build/
+/bin/
+*.o
+*.a
+*.so
+*.dylib
+
+# llama.cpp build
+lib/cli/llama.cpp/build/
+lib/cli/bin
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+*.exe
+go.sum
+
+# Other
+lib/cli/src/embeddedtools/data/
