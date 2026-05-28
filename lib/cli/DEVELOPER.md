@@ -13,7 +13,6 @@ lib/cli/
 ├── DEVELOPER.md        — This file
 ├── .gitignore          — Excludes generated binaries and embed staging area
 ├── config.yaml         — Sample / template configuration (copied to ~/.guido/config/ on install)
-├── test-mcp-server.py  — Built-in MCP test server (get_time, calculate, read_file, echo)
 ├── go.mod              — Go module definition (module: guido/lib/cli)
 ├── go.sum              — Dependency checksums
 │
@@ -21,7 +20,7 @@ lib/cli/
 │   ├── harness/        — Core abstraction layer (interfaces, types, config)
 │   ├── backends/       — LLM provider implementations
 │   ├── httpserver/     — HTTP server layer
-│   ├── tools/          — llama-server lifecycle, built-in tool calling, embedded extraction
+│   ├── tools/          — guido-server lifecycle, built-in tool calling, embedded extraction
 │   ├── embeddedtools/  — //go:embed staging package (data/ populated by make stage-embed; gitignored)
 │   ├── mcp/            — MCP client (stdio, HTTP+SSE, Streamable HTTP transports)
 │   └── cmd/            — Binary entry point
@@ -30,10 +29,13 @@ lib/cli/
 ├── exec/               — Runtime artifacts
 │   ├── bin/            — Compiled binaries and llama.cpp tools
 │   │   ├── guido            — Single self-contained binary with tools embedded (after make build)
-│   │   └── llama-cpp-tools/ — Compiled llama.cpp executables (source for embedding; used directly in dev)
+│   │   └── guido-cpp-tools/ — Compiled llama.cpp executables (source for embedding; used directly in dev)
 │   └── scripts/        — Build scripts
-│       ├── build-llama.sh          — Compiles llama.cpp and copies tools to exec/bin/llama-cpp-tools/
+│       ├── build-llama.sh          — Compiles llama.cpp and copies tools to exec/bin/guido-cpp-tools/
 │       └── create-py-wrappers.sh   — Generates shell wrappers for llama.cpp Python scripts
+│
+├── mcp/                — Built-in test MCP server
+│   └── basic_mcp.py   — Test server (get_time, calculate, read_file, echo)
 │
 └── modules/            — Git submodules
     └── llama.cpp/      — llama.cpp source (github.com/ggml-org/llama.cpp)
@@ -51,6 +53,7 @@ The harness defines the interfaces and types that every other package builds on.
 | `models.go` | All shared request/response types: `Config`, `BackendConfig`, `MCPServerConfig`, `ChatRequest`, `ChatResponse`, `ChatMessage`, `CompletionRequest`, `CompletionResponse`, `ModelInfo`, `ModelStatusInfo`, `Tool`, `ToolCall`, `ToolFunction`, `ToolCallFunction` |
 | `content.go` | `MessageContent` — dual-mode type that serializes as a plain JSON string (text-only) or an OpenAI-style content-part array (multimodal). Also defines `ContentPart`, `ImageURL`, and helpers `Text()`, `Parts()`, `TextPart()`, `ImageURLPart()` |
 | `config.go` | `LoadConfig()` — reads `config.yaml` via Viper, expands `${ENV_VAR}` references in string fields including MCP server `args` and `env` entries |
+| `errors.go` | Sentinel error values: `ErrNoAvailableBackend`, `ErrModelNotFound`, `ErrInvalidConfig`, `ErrProviderNotRegistered` |
 | `errors.go` | Shared error types |
 
 ### Key interfaces
@@ -94,8 +97,8 @@ type InTextToolCaller interface {
 
 | File | Provider | Notes |
 |------|----------|-------|
-| `llamacpp.go` | llama.cpp HTTP API | Talks to a running `llama-server` via REST. Used as the `inner` backend by `LazyLlamaCppBackend`. Tool calling uses **system-prompt injection** (see below) |
-| `lazy_llamacpp.go` | Lazy-loading llama.cpp | State machine wrapper: `unloaded → loading → ready → unloaded`. Starts `llama-server` on the first request; optionally unloads after `idle_timeout_seconds` of inactivity. Implements `StatusReporter` |
+| `llamacpp.go` | llama.cpp HTTP API | Talks to a running `guido-server` via REST. Used as the `inner` backend by `LazyLlamaCppBackend`. Tool calling uses **system-prompt injection** (see below) |
+| `lazy_llamacpp.go` | Lazy-loading llama.cpp | State machine wrapper: `unloaded → loading → ready → unloaded`. Starts `guido-server` on the first request; optionally unloads after `idle_timeout_seconds` of inactivity. Implements `StatusReporter` |
 | `openai.go` | OpenAI API | Full tool calling support via the `tools` / `tool_choice` API fields. Also used as the inner backend for Ollama |
 | `ollama.go` | Ollama | Delegates all LLM calls to an inner `OpenAIBackend` pointed at Ollama's OpenAI-compatible endpoint. On first use, registers a GGUF file with Ollama via `ollama create` if `model_path` is set. Uses `sync.Once` so registration happens at most once per process |
 | `anthropic.go` | Anthropic API | Translates OpenAI-style `image_url` content parts to Anthropic's `image/source` format |
@@ -129,7 +132,7 @@ llama-server has a known bug in some versions where it returns HTTP 500 when a r
 
 This approach is backend-transparent — `LazyLlamaCppBackend` delegates to `LlamaCppBackend.Chat()` so it picks up the fix automatically.
 
-**Streaming counterpart:** `streamChatWithToolPrompt()` applies the same message rewriting but calls llama-server with `"stream": true` and returns a `<-chan string` of raw tokens. This enables the CLI to stream the final answer to the terminal token-by-token. `StreamChat()` routes to it automatically when `req.Tools` is non-empty.
+**Streaming counterpart:** `streamChatWithToolPrompt()` applies the same message rewriting but calls guido-server with `"stream": true` and returns a `<-chan string` of raw tokens. This enables the CLI to stream the final answer to the terminal token-by-token. `StreamChat()` routes to it automatically when `req.Tools` is non-empty.
 
 **Exported parser:** `ParseToolCalls(text string) []harness.ToolCall` wraps the internal `parseToolCalls` regex, allowing the CLI streaming loop to detect tool calls after buffering the full token stream without importing internal symbols.
 
@@ -175,27 +178,27 @@ func Serve(ctx context.Context, cfg *harness.Config, h *harness.Harness, tc *Too
 
 ---
 
-## `src/tools/` — llama-server lifecycle, built-in tool calling, embedded extraction
+## `src/tools/` — guido-server lifecycle, built-in tool calling, embedded extraction
 
 | File | Purpose |
 |------|---------|
-| `manager.go` | `Manager` — locates `llama-server`, starts it as a subprocess (`StartLlamaServer`), waits for it to become healthy, stops it on `Close()`. Has an optional `libDir` field: when set (embedded build), `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH` is injected into the subprocess environment so the extracted dylibs are found at runtime |
+| `manager.go` | `Manager` — locates `guido-server`, starts it as a subprocess (`StartLlamaServer`), waits for it to become healthy, stops it on `Close()`. Has an optional `libDir` field: when set (embedded build), `DYLD_LIBRARY_PATH` / `LD_LIBRARY_PATH` is injected into the subprocess environment so the extracted dylibs are found at runtime |
 | `extract.go` | `ExtractEmbedded(fs embed.FS, targetDir string)` — extracts the embedded tools from `embeddedtools.ToolsFS` to `~/.guido/tools/`. Version-stamped: if `targetDir/.version` already matches the build stamp, extraction is skipped. Returns `nil, nil` in stub (non-embedded) builds so the caller can fall through to the filesystem fallback |
 | `toolcall.go` | `ExecuteTool(name, argsJSON)` — dispatches built-in tool calls from the model (`web_search`, `fetch_url`) to their implementations. MCP tool calls are routed through `mcp.Registry` before this is called |
 | `web.go` | `WebTools()` returns the tool schemas for `web_search` and `fetch_url`. Implementations: DuckDuckGo search and plain-text URL fetching |
 
 ### Tools resolution order
 
-Both CLI binaries resolve the tools directory at startup:
+The guido binary resolves the tools directory at startup:
 
 1. `$GUIDO_TOOLS_DIR` — explicit override, useful for development or CI
-2. `exec/bin/llama-cpp-tools` relative to CWD — the standard dev layout when running from the project root
-3. `llama-cpp-tools/` adjacent to the binary — works for symlinked installs
+2. `exec/bin/guido-cpp-tools` relative to CWD — the standard dev layout when running from the project root
+3. `guido-cpp-tools/` adjacent to the binary — works for symlinked installs
 4. Embedded extraction — `tools.ExtractEmbedded(embeddedtools.ToolsFS, "~/.guido/tools/")` — active only in binaries built with `-tags embed_tools`; no-op in regular builds
 
 ### Embedded dylibs and rpath
 
-On macOS, the `llama-server` binary is dynamically linked against `@rpath/libllama.0.dylib` and several other llama.cpp / ggml shared libraries. The rpath baked at compile time points at the original build directory. When tools are extracted to `~/.guido/tools/`, those dylibs live in `~/.guido/tools/lib/`. `Manager` handles this by setting `DYLD_LIBRARY_PATH` (macOS) or `LD_LIBRARY_PATH` (Linux) to `libDir` when spawning llama-server — no binary patching required.
+On macOS, the `guido-server` binary is dynamically linked against `@rpath/libllama.0.dylib` and several other llama.cpp / ggml shared libraries. The rpath baked at compile time points at the original build directory. When tools are extracted to `~/.guido/tools/`, those dylibs live in `~/.guido/tools/lib/`. `Manager` handles this by setting `DYLD_LIBRARY_PATH` (macOS) or `LD_LIBRARY_PATH` (Linux) to `libDir` when spawning guido-server — no binary patching required.
 
 ---
 
@@ -374,16 +377,16 @@ If `Registry.ExecuteTool` returns `handled=false`, the call falls through to ste
 ## `exec/scripts/`
 
 ### `build-llama.sh`
-Compiles the llama.cpp submodule and copies the resulting binaries to `exec/bin/llama-cpp-tools/`. Called by `make build-llama`. Detects OS/arch and sets appropriate CMake flags (Metal on macOS, CUDA on Linux with `nvidia-smi`).
+Compiles the llama.cpp submodule and copies the resulting binaries to `exec/bin/guido-cpp-tools/`. Called by `make build-llama`. Detects OS/arch and sets appropriate CMake flags (Metal on macOS, CUDA on Linux with `nvidia-smi`).
 
 ### `create-py-wrappers.sh`
-Generates thin shell wrappers in `exec/bin/llama-cpp-tools/` for the llama.cpp Python conversion scripts (`convert_hf_to_gguf.py`, etc.). The wrappers resolve the llama.cpp source directory at runtime relative to their own location (`../../../modules/llama.cpp`).
+Generates thin shell wrappers in `exec/bin/guido-cpp-tools/` for the llama.cpp Python conversion scripts (`convert_hf_to_gguf.py`, etc.). The wrappers resolve the llama.cpp source directory at runtime relative to their own location (`../../../modules/llama.cpp`).
 
 ---
 
 ## `modules/llama.cpp/`
 
-Git submodule pinned to `github.com/ggml-org/llama.cpp`. The Go code does not import anything from here directly — it's a C++ project compiled separately by `build-llama.sh`. Guido uses the resulting `llama-server` executable to serve local GGUF models.
+Git submodule pinned to `github.com/ggml-org/llama.cpp`. The Go code does not import anything from here directly — it's a C++ project compiled separately by `build-llama.sh`. Guido uses the resulting `guido-server` executable to serve local GGUF models.
 
 ---
 
@@ -391,7 +394,7 @@ Git submodule pinned to `github.com/ggml-org/llama.cpp`. The Go code does not im
 
 ```
 make build           # full build: build-llama → stage-embed → build-embedded (self-contained binary)
-make build-llama     # cmake build of llama.cpp → exec/bin/llama-cpp-tools/
+make build-llama     # cmake build of llama.cpp → exec/bin/guido-cpp-tools/
 make stage-embed     # copy executables + dylibs into src/embeddedtools/data/, write .version stamp
 make build-embedded  # stage-embed + go build -tags embed_tools → exec/bin/guido (~34 MB, self-contained)
 make build-go        # go build (no embed tag) — fast dev build, finds tools on filesystem

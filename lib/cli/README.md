@@ -14,9 +14,9 @@ make build    # compile llama.cpp → stage tools → build self-contained guido
 make install  # build + copy config to ~/.guido/config/ + /usr/local/bin symlinks
 ```
 
-`make build` produces a single self-contained binary at `exec/bin/guido`. The binary has all llama.cpp tools (`llama-server`, `llama-cli`, `llama-quantize`, and shared libraries) baked directly inside using Go's `//go:embed`. On the first run in a new location it silently extracts them to `~/.guido/tools/`; subsequent runs skip extraction.
+`make build` produces a single self-contained binary at `exec/bin/guido`. The binary has all llama.cpp tools (`guido-server`, `guido-cli`, `guido-quantize`, and shared libraries) baked directly inside using Go's `//go:embed`. On the first run in a new location it silently extracts them to `~/.guido/tools/`; subsequent runs skip extraction.
 
-`make install` places the binary at `~/bin/guido` and writes a starter config to `~/.guido/config/config.yaml` (skipped if the file already exists). It also creates `/usr/local/bin` symlinks for `guido` and every tool in `exec/bin/llama-cpp-tools/`.
+`make install` places the binary at `~/bin/guido` and writes a starter config to `~/.guido/config/config.yaml` (skipped if the file already exists). It also creates `/usr/local/bin` symlinks for `guido` and every tool in `exec/bin/guido-cpp-tools/`.
 
 ### Configure
 
@@ -32,7 +32,7 @@ models:
 backends:
   my-model:
     type: llamacpp
-    url: "embedded"   # auto-starts embedded llama-server on first request
+    url: "embedded"   # auto-starts embedded guido-server on first request
     port: 8002
     model: "gemma4"
     model_path: "${HOME}/.cache/huggingface/hub/.../model.gguf"
@@ -61,7 +61,7 @@ guido harness        # bare HTTP server (all backends, no tool injection — for
 guido complete "<prompt>" [flags]
 ```
 
-Sends a single prompt and prints the response, then exits. Any embedded llama-server started for this invocation is stopped on exit. When tools are active (the default), `complete` runs the full agentic loop and prints the final answer.
+Sends a single prompt and prints the response, then exits. Any embedded guido-server started for this invocation is stopped on exit. When tools are active (the default), `complete` runs the full agentic loop and prints the final answer.
 
 ```bash
 # Use the default model
@@ -107,7 +107,7 @@ guido complete "What time is it?" --native   # no tools, plain model response
 guido chat [flags]
 ```
 
-Starts a multi-turn conversation in your terminal. Full message history is maintained in memory and re-sent each request (llama-server's prompt cache speeds up repeated prefixes). Type `exit` or press Ctrl+C to quit.
+Starts a multi-turn conversation in your terminal. Full message history is maintained in memory and re-sent each request (guido-server's prompt cache speeds up repeated prefixes). Type `exit` or press Ctrl+C to quit.
 
 When using a llamacpp backend with tools active, responses stream token-by-token for the final answer — intermediate tool-call turns are silent. With OpenAI/Anthropic backends, tool turns use the non-streaming `Chat()` path. Without tools, all backends stream.
 
@@ -148,7 +148,7 @@ guido chat --image diagram.png --file architecture.md
 guido serve [flags]
 ```
 
-Starts a persistent HTTP server. Embedded llama-server processes use **lazy loading** — they start on the first request and optionally unload after the configured idle timeout. The server itself starts instantly with no VRAM usage.
+Starts a persistent HTTP server. Embedded guido-server processes use **lazy loading** — they start on the first request and optionally unload after the configured idle timeout. The server itself starts instantly with no VRAM usage.
 
 When tool flags are active, the server runs the **agentic loop internally**: it calls tools on the model's behalf and returns only the final text response to clients. Clients do not need to implement tool calling themselves.
 
@@ -335,11 +335,11 @@ models:
 
 backends:
 
-  # ── Local model (embedded llama-server) ─────────────────────────────────────
+  # ── Local model (embedded guido-server) ─────────────────────────────────────
   my-model:
     type: llamacpp
-    url: "embedded"                           # guido manages the llama-server process
-    port: 8002                                # port for this model's llama-server
+    url: "embedded"                           # guido manages the guido-server process
+    port: 8002                                # port for this model's guido-server
     model: "gemma4"                           # model name reported to clients
     model_path: "${HOME}/.../model.gguf"
     mmproj_path: "${HOME}/.../mmproj.gguf"    # optional — required for vision models
@@ -389,7 +389,7 @@ mcp_servers:
   - name: devtools
     enabled: true
     command: python3
-    args: ["/path/to/test-mcp-server.py"]
+    args: ["/path/to/basic_mcp.py"]
 
   - name: filesystem
     enabled: true
@@ -414,7 +414,7 @@ Environment variables in `model_path`, `mmproj_path`, `api_key`, and MCP `args`/
 
 ## Lazy Loading & Idle Timeout
 
-Embedded llama-server backends use lazy loading in `serve` mode:
+Embedded guido-server backends use lazy loading in `serve` mode:
 
 - **Server starts instantly** — no VRAM used at startup
 - **Model loads on the first request** — clients see a ~6s delay while it warms up
@@ -445,7 +445,7 @@ mcp_servers:
   - name: devtools
     enabled: true
     command: python3
-    args: ["/path/to/test-mcp-server.py"]
+    args: ["/path/to/basic_mcp.py"]
 
   # Remote server — HTTP+SSE or Streamable HTTP, auto-detected
   - name: my-remote
@@ -466,7 +466,7 @@ MCP tools are active by default — no extra flag required. Use `--native` to di
 
 ### Test server
 
-Guido ships with a ready-to-use test MCP server at `lib/cli/test-mcp-server.py`:
+Guido ships with a ready-to-use test MCP server at `lib/cli/mcp/basic_mcp.py`:
 
 | Tool | What it does |
 |------|-------------|
@@ -482,7 +482,7 @@ mcp_servers:
   - name: devtools
     enabled: true
     command: python3
-    args: ["/path/to/lib/cli/test-mcp-server.py"]
+    args: ["/path/to/lib/cli/mcp/basic_mcp.py"]
 ```
 
 Then test with:
@@ -544,14 +544,13 @@ lib/cli/
 ├── README.md
 ├── DEVELOPER.md           # Package-by-package developer reference
 ├── config.yaml            # Sample configuration (copied to ~/.guido/config/ on install)
-├── test-mcp-server.py     # Built-in MCP test server (get_time, calculate, read_file, echo)
 ├── go.mod / go.sum
 │
 ├── src/                   # All Go source code
 │   ├── harness/           # Core interfaces, types, and config
 │   ├── backends/          # LLM provider implementations (llamacpp, openai, anthropic, ollama, …)
 │   ├── httpserver/        # HTTP route registration and handlers
-│   ├── tools/             # llama-server lifecycle, built-in tool calling, and embedded extraction
+│   ├── tools/             # guido-server lifecycle, built-in tool calling, and embedded extraction
 │   ├── embeddedtools/     # Go embed staging — populated by make stage-embed, gitignored
 │   ├── mcp/               # MCP client (stdio, HTTP+SSE, Streamable HTTP transports)
 │   └── cmd/
@@ -560,10 +559,13 @@ lib/cli/
 ├── exec/                  # Runtime artifacts
 │   ├── bin/               # Compiled binaries and llama.cpp tools
 │   │   ├── guido          # Single binary (after make build — tools embedded inside)
-│   │   └── llama-cpp-tools/ # Source for embedding; also used directly in dev
+│   │   └── guido-cpp-tools/ # Source for embedding; also used directly in dev
 │   └── scripts/           # Build scripts
 │       ├── build-llama.sh
 │       └── create-py-wrappers.sh
+│
+├── mcp/                   # Built-in test MCP server
+│   └── basic_mcp.py       # Test server (get_time, calculate, read_file, echo)
 │
 └── modules/               # Git submodules
     └── llama.cpp/         # llama.cpp source (compiled separately)
@@ -622,7 +624,7 @@ Register it in `initializeBackends` in `cmd/cli/main.go` and add a config entry 
 ## Troubleshooting
 
 **Model doesn't load / no output**
-- Check `guido serve` logs — llama-server stderr is forwarded
+- Check `guido serve` logs — guido-server stderr is forwarded
 - For vision models, confirm `mmproj_path` points to a valid mmproj file
 - Run `curl http://localhost:<port>/health` to check the embedded server directly
 
@@ -633,13 +635,13 @@ Register it in `initializeBackends` in `cmd/cli/main.go` and add a config entry 
 **Port conflict**
 
 ```
-a llama-server is already running on port 8002 but serves a different model
+a guido-server is already running on port 8002 but serves a different model
 ```
 
 Kill the old process and retry:
 
 ```bash
-pkill -f 'llama-server.*8002'
+pkill -f 'guido-server.*8002'
 ```
 
 **Config not found**

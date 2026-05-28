@@ -57,13 +57,13 @@ func (m *Manager) GetToolPath(toolName string) (string, error) {
 	return path, nil
 }
 
-// StartLlamaServer starts llama-server with the given model and waits until it
+// StartLlamaServer starts guido-server with the given model and waits until it
 // is actually accepting connections (or times out).
 // chatTemplate and mmProjPath are both optional (pass "" to omit).
 // mmProjPath is the path to a multimodal projector file — required for vision
 // models such as Gemma 4, LLaVA, Qwen-VL, etc.
 func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, chatTemplate, mmProjPath string) (int, error) {
-	toolPath, err := m.GetToolPath("llama-server")
+	toolPath, err := m.GetToolPath("guido-server")
 	if err != nil {
 		return 0, err
 	}
@@ -86,7 +86,7 @@ func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, c
 		args = append(args, "--chat-template", chatTemplate)
 	}
 
-	// Suppress llama-server's own verbose output — we emit clean progress lines.
+	// Suppress guido-server's own verbose output — we emit clean progress lines.
 	cmd := exec.Command(toolPath, args...)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
@@ -102,10 +102,10 @@ func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, c
 		cmd.Env = append(os.Environ(), libEnvKey+"="+m.libDir)
 	}
 
-	fmt.Printf("[guido] starting llama-server on port %d...\n", port)
+	fmt.Printf("[guido] starting guido-server on port %d...\n", port)
 
 	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("failed to start llama-server: %w", err)
+		return 0, fmt.Errorf("failed to start guido-server: %w", err)
 	}
 
 	// Watch for early exit in a goroutine. cmd.ProcessState is only populated
@@ -132,9 +132,9 @@ func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, c
 		select {
 		case err := <-exitErr:
 			if err != nil {
-				return 0, fmt.Errorf("llama-server exited during startup: %w", err)
+				return 0, fmt.Errorf("guido-server exited during startup: %w", err)
 			}
-			return 0, fmt.Errorf("llama-server exited during startup (no error)")
+			return 0, fmt.Errorf("guido-server exited during startup (no error)")
 		default:
 		}
 
@@ -163,33 +163,33 @@ func (m *Manager) StartLlamaServer(modelPath string, port int, nGPULayers int, c
 
 	if !ready {
 		cmd.Process.Kill() //nolint:errcheck
-		return 0, fmt.Errorf("llama-server did not become ready within %s", time.Since(startTime).Round(time.Second))
+		return 0, fmt.Errorf("guido-server did not become ready within %s", time.Since(startTime).Round(time.Second))
 	}
 
-	fmt.Printf("[guido] llama-server ready on port %d (%s)\n", port, time.Since(startTime).Round(time.Second))
+	fmt.Printf("[guido] guido-server ready on port %d (%s)\n", port, time.Since(startTime).Round(time.Second))
 
 	// Store process reference
-	m.launched["llama-server"] = &ManagedProcess{
+	m.launched["guido-server"] = &ManagedProcess{
 		cmd: cmd,
 	}
 
 	return port, nil
 }
 
-// StopLlamaServer stops the running llama-server instance
+// StopLlamaServer stops the running guido-server instance
 func (m *Manager) StopLlamaServer() error {
-	proc, ok := m.launched["llama-server"]
+	proc, ok := m.launched["guido-server"]
 	if !ok {
-		return errors.New("llama-server not running")
+		return errors.New("guido-server not running")
 	}
 
 	if proc.cmd.Process != nil {
 		if err := proc.cmd.Process.Kill(); err != nil {
-			return fmt.Errorf("failed to kill llama-server: %w", err)
+			return fmt.Errorf("failed to kill guido-server: %w", err)
 		}
 	}
 
-	delete(m.launched, "llama-server")
+	delete(m.launched, "guido-server")
 	return nil
 }
 

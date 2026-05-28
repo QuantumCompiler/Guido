@@ -100,12 +100,15 @@ fi
 
 echo "Extracting compiled tools to $OUTPUT_DIR..."
 
-# Copy found tools
+# Copy found tools, renaming llama-* → guido-* so Guido's bundled server is
+# distinguishable from any system-installed llama-server the user may have.
 FOUND_COUNT=0
 for TOOL in "${TOOLS[@]}"; do
     if [ -f "$TOOL" ]; then
-        cp "$TOOL" "$OUTPUT_DIR/"
-        echo "  ✓ $(basename "$TOOL")"
+        ORIGINAL_NAME="$(basename "$TOOL")"
+        RENAMED="${ORIGINAL_NAME/llama-/guido-}"
+        cp "$TOOL" "$OUTPUT_DIR/$RENAMED"
+        echo "  ✓ $ORIGINAL_NAME → $RENAMED"
         ((FOUND_COUNT++))
     fi
 done

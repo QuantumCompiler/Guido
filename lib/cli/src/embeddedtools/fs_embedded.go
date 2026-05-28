@@ -9,7 +9,7 @@ import "embed"
 //
 // Layout inside the FS:
 //
-//	data/bin/   – executables  (llama-server, llama-cli, llama-quantize, …)
+//	data/bin/   – executables  (guido-server, guido-cli, guido-quantize, …)
 //	data/lib/   – dylibs       (libllama, libggml, … — macOS only)
 //	data/.version – stamp written by make stage-embed; used to skip re-extraction
 //

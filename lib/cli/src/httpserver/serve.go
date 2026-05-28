@@ -39,7 +39,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 // tc may be nil — when non-nil the handler runs the agentic tool loop
 // internally for every chat request and returns only the final answer.
 // onShutdown is called (if non-nil) after the HTTP server has stopped — use it
-// to clean up backends (e.g. kill the llama-server process).
+// to clean up backends (e.g. kill the guido-server process).
 func Serve(ctx context.Context, cfg *harness.Config, h *harness.Harness, tc *ToolConfig, onShutdown func()) error {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)

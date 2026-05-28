@@ -5,7 +5,7 @@ set -e
 # Usage: ./create-py-wrappers.sh <llama_cpp_dir> <output_dir>
 
 LLAMA_CPP_DIR="${1:-./modules/llama.cpp}"
-OUTPUT_DIR="${2:-./exec/bin/llama-cpp-tools}"
+OUTPUT_DIR="${2:-./exec/bin/guido-cpp-tools}"
 
 echo "Creating Python script wrappers..."
 echo "  Source: $LLAMA_CPP_DIR"
@@ -37,7 +37,7 @@ for SCRIPT_PAIR in "${SCRIPTS[@]}"; do
 #!/bin/bash
 # Auto-generated wrapper for llama.cpp Python script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Wrapper lives at exec/bin/llama-cpp-tools/ — three levels up then into modules/
+# Wrapper lives at exec/bin/guido-cpp-tools/ — three levels up then into modules/
 LLAMA_DIR="$(cd "$SCRIPT_DIR/../../../modules/llama.cpp" && pwd)"
 SCRIPT_NAME="PLACEHOLDER_SCRIPT"
 

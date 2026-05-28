@@ -64,21 +64,21 @@ var rootCmd = &cobra.Command{
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		// Resolve tools directory — checked in priority order:
 		// 1. $GUIDO_TOOLS_DIR env var (explicit override)
-		// 2. exec/bin/llama-cpp-tools relative to CWD (dev/project layout)
-		// 3. llama-cpp-tools adjacent to the installed binary
+		// 2. exec/bin/guido-cpp-tools relative to CWD (dev/project layout)
+		// 3. guido-cpp-tools adjacent to the installed binary
 		// 4. Embedded tools baked into the binary (embed_tools build tag)
 		var err error
 		if toolsDir := os.Getenv("GUIDO_TOOLS_DIR"); toolsDir != "" {
 			toolMgr, err = tools.NewManagerFromDir(toolsDir)
-		} else if _, statErr := os.Stat("exec/bin/llama-cpp-tools"); statErr == nil {
-			toolMgr, err = tools.NewManagerFromDir("exec/bin/llama-cpp-tools")
+		} else if _, statErr := os.Stat("exec/bin/guido-cpp-tools"); statErr == nil {
+			toolMgr, err = tools.NewManagerFromDir("exec/bin/guido-cpp-tools")
 		} else if exePath, exeErr := os.Executable(); exeErr == nil {
 			// Resolve symlinks so /usr/local/bin/guido → .../exec/bin/guido
-			// before looking for llama-cpp-tools in the same directory.
+			// before looking for guido-cpp-tools in the same directory.
 			if resolved, resErr := filepath.EvalSymlinks(exePath); resErr == nil {
 				exePath = resolved
 			}
-			adj := filepath.Join(filepath.Dir(exePath), "llama-cpp-tools")
+			adj := filepath.Join(filepath.Dir(exePath), "guido-cpp-tools")
 			if _, statErr := os.Stat(adj); statErr == nil {
 				toolMgr, err = tools.NewManagerFromDir(adj)
 			}
@@ -99,7 +99,7 @@ var rootCmd = &cobra.Command{
 	},
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
 		// Note: We intentionally do NOT close the tool manager here,
-		// as the llama-server is a long-lived process that should persist
+		// as the guido-server is a long-lived process that should persist
 		// across multiple CLI invocations for efficient reuse.
 		// The server will be cleaned up when the user exits their shell session.
 	},
@@ -132,7 +132,7 @@ var completeCmd = &cobra.Command{
 			log.Fatal("No backends configured")
 		}
 
-		// Kill any llama-server we started when this command exits.
+		// Kill any guido-server we started when this command exits.
 		// If the server was already running we didn't add it to toolMgr.launched,
 		// so Close() is a no-op in that case.
 		defer toolMgr.Close()
@@ -212,7 +212,7 @@ var chatCmd = &cobra.Command{
 			log.Fatal("No backends configured")
 		}
 
-		// Kill any llama-server we started when the session ends.
+		// Kill any guido-server we started when the session ends.
 		defer toolMgr.Close()
 
 		router := harness.NewSimpleRouter(cfg, providers)
@@ -373,7 +373,7 @@ The server exposes OpenAI-compatible endpoints:
   GET  /v1/models
   GET  /health
 
-Press Ctrl+C to stop — any llama-server processes started by this session
+Press Ctrl+C to stop — any guido-server processes started by this session
 will be terminated automatically.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		cfg, err := harness.LoadConfig(configPath)
@@ -456,7 +456,7 @@ var harnessCmd = &cobra.Command{
 	Short: "Start the bare HTTP harness server (all backends, no tool injection)",
 	Long: `Starts an OpenAI-compatible HTTP server that exposes every backend
 configured in config.yaml. All embedded llamacpp backends use lazy loading —
-the llama-server process starts on the first request and can optionally unload
+the guido-server process starts on the first request and can optionally unload
 after the configured idle_timeout_seconds.
 
 Unlike 'serve', this command does not inject tools into the model — it is
@@ -476,7 +476,7 @@ Endpoints:
 		}
 
 		h := harness.NewHarness(cfg)
-		// Always lazy: llama-server starts on the first request.
+		// Always lazy: guido-server starts on the first request.
 		providers := initializeBackends(h, cfg, toolMgr, true)
 		if len(providers) == 0 {
 			log.Fatal("No backends configured. Set up at least one backend in config.")
@@ -508,8 +508,8 @@ var modelsCmd = &cobra.Command{
 		// Initialize harness
 		h := harness.NewHarness(cfg)
 
-		// Register backends
-		providers := initializeBackends(h, cfg, toolMgr, false)
+		// Register backends — lazy=true so no guido-server is spawned just to list models.
+		providers := initializeBackends(h, cfg, toolMgr, true)
 
 		if len(providers) == 0 {
 			fmt.Println("No backends configured")
@@ -528,7 +528,11 @@ var modelsCmd = &cobra.Command{
 
 		fmt.Println("Available Models:")
 		for _, m := range models {
-			fmt.Printf("  - %s (provider: %s, type: %s)\n", m.Name, m.Provider, m.Type)
+			if m.Name != "" && m.Name != m.ID {
+				fmt.Printf("  - %s  (%s — %s)\n", m.ID, m.Name, m.Provider)
+			} else {
+				fmt.Printf("  - %s  (%s)\n", m.ID, m.Provider)
+			}
 		}
 	},
 }
@@ -833,7 +837,7 @@ func filterBackends(cfg *harness.Config, target string, all bool) {
 // initializeBackends registers all configured backends with the harness.
 //
 // When lazy is true (serve mode), embedded llamacpp backends are wrapped in a
-// LazyLlamaCppBackend so the llama-server process only starts on the first
+// LazyLlamaCppBackend so the guido-server process only starts on the first
 // request and can optionally unload after an idle timeout.
 //
 // When lazy is false (complete / chat / models commands), the server is started
@@ -891,7 +895,7 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 
 				if lazy {
 					// ── Lazy path (serve mode) ────────────────────────────────
-					// The LazyLlamaCppBackend manages the llama-server lifecycle
+					// The LazyLlamaCppBackend manages the guido-server lifecycle
 					// internally: it starts on the first request and optionally
 					// unloads after idleTimeout seconds of inactivity.
 					gpuLayers := bcfg.GPULayers
@@ -900,7 +904,7 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 					}
 					idleTimeout := time.Duration(bcfg.IdleTimeoutSeconds) * time.Second
 					lb := backends.NewLazyLlamaCppBackend(
-						tm, expandedModelPath, expandedMmProjPath, llamacppURL, modelName,
+						tm, name, expandedModelPath, expandedMmProjPath, llamacppURL, modelName,
 						bcfg.ChatTemplate, port, gpuLayers, idleTimeout,
 					)
 					providers[name] = lb
@@ -912,16 +916,16 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 				// Check if a server is already running on this port.
 				status := llamaServerStatus(llamacppURL, expandedModelPath)
 				if status == serverLoading {
-					log.Printf("Waiting for llama-server on %s to finish loading...", llamacppURL)
+					log.Printf("Waiting for guido-server on %s to finish loading...", llamacppURL)
 					status = waitForServer(llamacppURL, expandedModelPath, 5*time.Minute)
 				}
 				switch status {
 				case serverReady:
-					log.Printf("Using existing llama-server for %q at %s", name, llamacppURL)
+					log.Printf("Using existing guido-server for %q at %s", name, llamacppURL)
 				case serverWrongModel:
 					log.Fatalf(
-						"A llama-server is already running on %s but serves a different model.\n"+
-							"Kill it first, then retry:\n\n  pkill -f 'llama-server.*%d'\n",
+						"A guido-server is already running on %s but serves a different model.\n"+
+							"Kill it first, then retry:\n\n  pkill -f 'guido-server.*%d'\n",
 						llamacppURL, port,
 					)
 				case serverNotRunning, serverLoading:
@@ -932,7 +936,7 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 						}
 						_, err := tm.StartLlamaServer(expandedModelPath, port, gpuLayers, bcfg.ChatTemplate, expandedMmProjPath)
 						if err != nil {
-							log.Fatalf("Failed to start llama-server for %q: %v\n", name, err)
+							log.Fatalf("Failed to start guido-server for %q: %v\n", name, err)
 						}
 					}
 				}
@@ -1037,7 +1041,7 @@ const (
 	serverWrongModel
 )
 
-// llamaServerStatus checks whether a llama-server on baseURL is alive and
+// llamaServerStatus checks whether a guido-server on baseURL is alive and
 // serving the expected model.
 //
 // States returned:
@@ -1058,7 +1062,7 @@ func llamaServerStatus(baseURL, expectedModelPath string) llamaStatus {
 	switch healthResp.StatusCode {
 	case http.StatusServiceUnavailable: // 503 = model loading
 		// Can't verify model path yet — assume it's ours and wait
-		log.Printf("llama-server on %s is still loading the model (503)...", baseURL)
+		log.Printf("guido-server on %s is still loading the model (503)...", baseURL)
 		return serverLoading
 	case http.StatusOK:
 		// ready — fall through to model verification
@@ -1121,7 +1125,7 @@ func waitForServer(baseURL, expectedModelPath string, timeout time.Duration) lla
 }
 
 // stopTokens are end-of-turn markers that some models leak into their output
-// even when llama-server is supposed to stop at them.
+// even when guido-server is supposed to stop at them.
 var stopTokens = []string{
 	"<|im_end|>", "<|eot_id|>", "<end_of_turn>", "<|end|>",
 	"<|im_start|>user", "<|im_start|>assistant",

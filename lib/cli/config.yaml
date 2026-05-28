@@ -1,100 +1,90 @@
 server:
   port: 8080
-  mode: http              # 'http' for service, 'cli' for command-line
+  # mode: http   # 'http' for service, 'cli' for command-line (default: http)
 
 models:
-  default: llama33
+  default: my-model   # backend key used when no -m flag is given
 
 backends:
-  # ─────────────────────────────────────────────────────────────────────
-  # LOCAL MODELS (llama.cpp embedded server)
-  #
-  # Each entry is a named provider you reference with -m <name>.
-  # Set "type: llamacpp" when you need more than one local model.
-  # The key name alone is enough for a single backend (backward compat).
-  # ─────────────────────────────────────────────────────────────────────
 
-  gemma4:
+  # ── Local model (embedded llama-server) ─────────────────────────────────────
+  # Guido starts and manages the llama-server subprocess automatically.
+  # The server loads on the first request and optionally unloads after idle.
+  my-model:
     type: llamacpp
     url: "embedded"
-    port: 8002
-    model: "gemma4"
-    model_path: "${HOME}/.cache/huggingface/hub/models/google/gguf/gemma4:31b-q4km.gguf"
-    # mmproj_path:
-    idle_timeout_seconds: 60
+    port: 8002                                # port for this model's llama-server
+    model: "my-model-name"                    # model name reported to clients
+    model_path: "${HOME}/.cache/huggingface/hub/.../model.gguf"
+    # mmproj_path: "${HOME}/.cache/huggingface/hub/.../mmproj.gguf"  # vision models only
+    idle_timeout_seconds: 300                 # 0 = stay loaded until server stops
+    # gpu_layers: 99                          # layers to offload to GPU (default: 99)
 
-  llama33:
-    type: llamacpp
-    url: "embedded"
-    port: 8003
-    model: "llama3.3"
-    model_path: "${HOME}/.cache/huggingface/hub/models/meta/gguf/llam3.3:70b-q4km.gguf"
-    # mmproj_path:
-    idle_timeout_seconds: 60
-
-  gpt-oss:
-    type: llamacpp
-    url: "embedded"
-    port: 8010
-    model: "gemma4"
-    model_path: "${HOME}/.cache/huggingface/hub/models/openai/gguf/gpt-oss:20b-f16.gguf"
-    # mmproj_path:
-    idle_timeout_seconds: 60
-
-  # Multiple local models — use explicit "type: llamacpp" + unique key names
-  # Each gets its own llama-server on a separate port (auto-assigned or explicit).
-
-  # Point to an already-running llama-server (no embedded spawn):
-  # external-llm:
+  # ── External llama-server (you manage it) ───────────────────────────────────
+  # external:
   #   type: llamacpp
   #   url: "http://192.168.1.50:8000"
   #   model: "my-remote-model"
 
-  # ─────────────────────────────────────────────────────────────────────
-  # OLLAMA (local daemon — run `ollama serve` first)
-  # ─────────────────────────────────────────────────────────────────────
-
+  # ── Ollama (local daemon — run `ollama serve` first) ────────────────────────
+  # If model_path is set, Guido registers the GGUF with Ollama on first use.
   # ollama:
   #   type: ollama
-  #   model: "llama3.2"           # any model you've pulled with `ollama pull`
-  #   url: "http://localhost:11434"  # optional — this is the default
+  #   model: "llama3.2"                       # any model pulled with `ollama pull`
+  #   url: "http://localhost:11434"           # optional — this is the default
+  #   model_path: "${HOME}/.cache/huggingface/hub/.../model.gguf"  # optional
 
-  # ─────────────────────────────────────────────────────────────────────
-  # CLOUD APIs
-  # ─────────────────────────────────────────────────────────────────────
-
+  # ── OpenAI ──────────────────────────────────────────────────────────────────
   # openai:
   #   api_key: "${OPENAI_API_KEY}"
   #   model: "gpt-4o"
 
+  # ── Anthropic ───────────────────────────────────────────────────────────────
   # anthropic:
   #   api_key: "${ANTHROPIC_API_KEY}"
-  #   model: "claude-3-5-sonnet-20241022"
+  #   model: "claude-opus-4-5"
 
-  # OpenAI-compatible endpoint (Azure, custom proxy, etc.):
+  # ── OpenAI-compatible endpoint (Azure, custom proxy, etc.) ──────────────────
   # openai-azure:
   #   type: openai
   #   api_key: "${AZURE_OPENAI_KEY}"
   #   url: "https://my-resource.openai.azure.com/..."
   #   model: "gpt-4"
 
-  # ─────────────────────────────────────────────────────────────────────
-  # TESTING
-  # ─────────────────────────────────────────────────────────────────────
+  # ── Mock (testing — no model file needed) ───────────────────────────────────
+  # mock:
+  #   model: "test-model"
 
-  mock:
-    model: "test-model"
-
-mcp_servers:
-  - name: devtools
-    enabled: true
-    command: python3
-    args: ["/Users/taylor/Data/Development/Projects/Guido/lib/cli/test-mcp-server.py"]
-
-  # ── Remote server (HTTP+SSE or Streamable HTTP — auto-detected) ─────────────
-  # Generic remote example with auth header:
-  # - name: my-remote
-  #   enabled: true
-  #   url: "https://mcp.example.com"
-  #   headers:
-  #     Authorization: "Bearer ${MY_API_TOKEN}"
+# ── MCP servers (optional) ──────────────────────────────────────────────────
+# Connect to Model Context Protocol servers. Tools are available automatically
+# when --mcp or no tool flag is used. Named mcp__<server>__<tool>.
+#
+# To enable, replace the empty list below with one or more server entries.
+# Stdio (local subprocess) and remote HTTP servers are both supported.
+#
+# mcp_servers:
+#   # Built-in test server (get_time, calculate, read_file, echo):
+#   - name: devtools
+#     enabled: true
+#     command: python3
+#     args: ["/path/to/guido/lib/cli/test-mcp-server.py"]
+#
+#   # Local filesystem access:
+#   - name: filesystem
+#     enabled: true
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "${HOME}/Documents"]
+#
+#   # Git repository tools:
+#   - name: git
+#     enabled: true
+#     command: uvx
+#     args: ["mcp-server-git", "--repository", "."]
+#
+#   # Remote server (HTTP+SSE or Streamable HTTP — auto-detected):
+#   - name: my-remote
+#     enabled: true
+#     url: "https://mcp.example.com"
+#     headers:
+#       Authorization: "Bearer ${MY_API_TOKEN}"
+mcp_servers: []

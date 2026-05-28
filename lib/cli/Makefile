@@ -34,7 +34,7 @@ INSTALL_DIR := $(HOME)/bin
 SYMLINK_DIR := /usr/local/bin
 
 LLAMA_BUILD_DIR := $(MODULES_DIR)/llama.cpp/build
-LLAMA_TOOLS_DIR := $(BIN_DIR)/llama-cpp-tools
+GUIDO_TOOLS_DIR := $(BIN_DIR)/guido-cpp-tools
 
 EMBED_DIR       := src/embeddedtools/data
 EMBED_BIN_DIR   := $(EMBED_DIR)/bin
@@ -65,8 +65,8 @@ build: build-llama build-embedded
 # Build llama.cpp tools
 build-llama:
 	@echo "Building llama.cpp tools for $(OS)-$(ARCH)..."
-	@./$(SCRIPTS_DIR)/build-llama.sh "$(LLAMA_BUILD_DIR)" "$(LLAMA_TOOLS_DIR)"
-	@echo "✓ llama.cpp tools built: $(LLAMA_TOOLS_DIR)/"
+	@./$(SCRIPTS_DIR)/build-llama.sh "$(LLAMA_BUILD_DIR)" "$(GUIDO_TOOLS_DIR)"
+	@echo "✓ llama.cpp tools built: $(GUIDO_TOOLS_DIR)/"
 
 # Build Go binaries
 build-go:
@@ -82,8 +82,8 @@ stage-embed:
 	@echo "Staging tools for embedding..."
 	@mkdir -p $(EMBED_BIN_DIR) $(EMBED_LIB_DIR)
 	@# Copy key executables (skip Python scripts which need a runtime anyway)
-	@for tool in llama-server llama-cli llama-quantize llama-gguf llama-imatrix llama-bench; do \
-		src="$(LLAMA_TOOLS_DIR)/$$tool"; \
+	@for tool in guido-server guido-cli guido-quantize guido-gguf guido-imatrix guido-bench; do \
+		src="$(GUIDO_TOOLS_DIR)/$$tool"; \
 		if [ -f "$$src" ]; then \
 			cp "$$src" "$(EMBED_BIN_DIR)/$$tool"; \
 			echo "  bin/$$tool"; \
@@ -100,7 +100,7 @@ stage-embed:
 	@echo "✓ Staged to $(EMBED_DIR)/ (version: $(VERSION)-$(OS)-$(ARCH))"
 
 # Build self-contained binary with all llama.cpp tools baked in.
-# Requires build-llama (or an existing LLAMA_TOOLS_DIR) to have run first.
+# Requires build-llama (or an existing GUIDO_TOOLS_DIR) to have run first.
 build-embedded: stage-embed
 	@echo "Building self-contained embedded binary..."
 	@mkdir -p $(BIN_DIR)
@@ -128,8 +128,8 @@ symlinks:
 	@echo "  Guido binary:"
 	@sudo ln -sf "$(CURDIR)/$(BIN_DIR)/guido" "$(SYMLINK_DIR)/guido"
 	@echo "    guido"
-	@echo "  llama.cpp tools:"
-	@for tool in "$(CURDIR)/$(LLAMA_TOOLS_DIR)"/*; do \
+	@echo "  guido tools:"
+	@for tool in "$(CURDIR)/$(GUIDO_TOOLS_DIR)"/*; do \
 		name=$$(basename "$$tool"); \
 		sudo ln -sf "$$tool" "$(SYMLINK_DIR)/$$name"; \
 		echo "    $$name"; \
@@ -138,7 +138,7 @@ symlinks:
 	@echo "✓ Installation complete!"
 	@echo ""
 	@echo "Config:    $(CONFIG_DIR)/config.yaml"
-	@echo "Symlinks:  $(SYMLINK_DIR)/guido, llama-server, ..."
+	@echo "Symlinks:  $(SYMLINK_DIR)/guido, guido-server, ..."
 	@echo ""
 	@echo "To use:"
 	@echo "  guido serve"

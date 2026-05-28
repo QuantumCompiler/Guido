@@ -14,7 +14,7 @@ import (
 	"guido/lib/cli/src/tools"
 )
 
-// lazyState tracks the lifecycle of the embedded llama-server process.
+// lazyState tracks the lifecycle of the embedded guido-server process.
 type lazyState int
 
 const (
@@ -41,26 +41,29 @@ type LazyLlamaCppBackend struct {
 	idleTimeout  time.Duration // 0 = never unload
 
 	// immutable startup config
+	backendKey   string // config key name (e.g. "gemma4", "gpt-oss") — used as model ID
 	toolMgr      *tools.Manager
 	modelPath    string
 	mmProjPath   string // optional multimodal projector (vision models)
 	baseURL      string
-	model        string
+	model        string // model name from config (may differ from backendKey)
 	chatTemplate string
 	port         int
 	gpuLayers    int
 }
 
 // NewLazyLlamaCppBackend creates a lazy-loading llama.cpp backend.
-// idleTimeout of 0 means "never unload once loaded".
-// mmProjPath is optional — set it to enable vision/multimodal support.
+// backendKey is the config key name (e.g. "gemma4", "gpt-oss") used as the
+// unique model ID returned by ListModels. idleTimeout of 0 means "never unload
+// once loaded". mmProjPath is optional — set it to enable vision/multimodal support.
 func NewLazyLlamaCppBackend(
 	tm *tools.Manager,
-	modelPath, mmProjPath, baseURL, model, chatTemplate string,
+	backendKey, modelPath, mmProjPath, baseURL, model, chatTemplate string,
 	port, gpuLayers int,
 	idleTimeout time.Duration,
 ) *LazyLlamaCppBackend {
 	return &LazyLlamaCppBackend{
+		backendKey:   backendKey,
 		toolMgr:      tm,
 		modelPath:    modelPath,
 		mmProjPath:   mmProjPath,
@@ -165,24 +168,24 @@ func (lb *LazyLlamaCppBackend) load(done chan struct{}) {
 
 	log.Printf("[guido] lazy-loading model %q...", lb.model)
 
-	// Check if a llama-server is already running on this port.
+	// Check if a guido-server is already running on this port.
 	status := lb.checkServerStatus()
 
 	var err error
 	switch status {
 	case lazyServerReady:
-		log.Printf("[guido] reusing existing llama-server for %q at %s", lb.model, lb.baseURL)
+		log.Printf("[guido] reusing existing guido-server for %q at %s", lb.model, lb.baseURL)
 
 	case lazyServerLoading:
-		log.Printf("[guido] waiting for existing llama-server at %s to finish loading...", lb.baseURL)
+		log.Printf("[guido] waiting for existing guido-server at %s to finish loading...", lb.baseURL)
 		if lb.waitForServerReady(5*time.Minute) != lazyServerReady {
-			err = fmt.Errorf("llama-server at %s did not become ready in time", lb.baseURL)
+			err = fmt.Errorf("guido-server at %s did not become ready in time", lb.baseURL)
 		}
 
 	case lazyServerWrongModel:
 		err = fmt.Errorf(
-			"a llama-server is already running on %s but serves a different model — "+
-				"kill it first (pkill -f 'llama-server.*%d') then retry",
+			"a guido-server is already running on %s but serves a different model — "+
+				"kill it first (pkill -f 'guido-server.*%d') then retry",
 			lb.baseURL, lb.port,
 		)
 
@@ -215,7 +218,7 @@ func (lb *LazyLlamaCppBackend) unload() {
 	log.Printf("[guido] unloading model %q after %s idle", lb.model, lb.idleTimeout)
 	if lb.toolMgr != nil {
 		if err := lb.toolMgr.StopLlamaServer(); err != nil {
-			log.Printf("[guido] error stopping llama-server: %v", err)
+			log.Printf("[guido] error stopping guido-server: %v", err)
 		}
 	}
 	lb.inner = nil
@@ -394,10 +397,18 @@ func (lb *LazyLlamaCppBackend) StreamChat(ctx context.Context, req *harness.Chat
 
 // ListModels returns static metadata without forcing a load — the GUI can call
 // this to discover available models even while they're unloaded.
+//
+// ID is the backend config key (e.g. "gpt-oss") — this is what users pass to
+// -m and what the router resolves. Name is the model: field from config (e.g.
+// "gemma4"), which may differ from the key and is shown for human reference.
 func (lb *LazyLlamaCppBackend) ListModels(_ context.Context) ([]harness.ModelInfo, error) {
+	id := lb.backendKey
+	if id == "" {
+		id = lb.model // fallback for backends created without a key
+	}
 	return []harness.ModelInfo{
 		{
-			ID:       lb.model,
+			ID:       id,
 			Name:     lb.model,
 			Provider: "llamacpp",
 			Type:     "chat",
