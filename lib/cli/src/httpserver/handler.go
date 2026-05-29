@@ -10,6 +10,7 @@ import (
 
 	"guido/lib/cli/src/backends"
 	"guido/lib/cli/src/harness"
+	"guido/lib/cli/src/logger"
 )
 
 // ToolConfig holds the server-side tool set and executor used when the serve
@@ -29,6 +30,29 @@ var stopTokens = []string{
 	"\nUser:", "\nHuman:",
 }
 
+// lastUserInput returns the plain text of the most recent user message, used
+// to record what the user submitted in the per-chat log.
+func lastUserInput(msgs []harness.ChatMessage) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			return msgs[i].Content.PlainText()
+		}
+	}
+	return ""
+}
+
+// estimatePromptTokens approximates the prompt size of a message list by
+// estimating tokens over the concatenated plain text of every message. Used for
+// streaming responses where the backend doesn't report a usage block.
+func estimatePromptTokens(msgs []harness.ChatMessage) int {
+	var b strings.Builder
+	for _, m := range msgs {
+		b.WriteString(m.Content.PlainText())
+		b.WriteByte('\n')
+	}
+	return logger.EstimateTokens(b.String())
+}
+
 func stripStopTokens(s string) string {
 	for _, tok := range stopTokens {
 		if idx := strings.Index(s, tok); idx >= 0 {
@@ -41,13 +65,15 @@ func stripStopTokens(s string) string {
 // Handler handles HTTP requests backed by a harness instance.
 type Handler struct {
 	h       *harness.Harness
-	toolCfg *ToolConfig // nil when no server-side tools are configured
+	toolCfg *ToolConfig  // nil when no server-side tools are configured
+	log     *logger.Logger // nil → logging disabled
 }
 
 // NewHandler creates a Handler wrapping the given harness.
 // tc may be nil (no server-side tool injection).
-func NewHandler(h *harness.Harness, tc *ToolConfig) *Handler {
-	return &Handler{h: h, toolCfg: tc}
+// lg may be nil (no logging).
+func NewHandler(h *harness.Harness, tc *ToolConfig, lg *logger.Logger) *Handler {
+	return &Handler{h: h, toolCfg: tc, log: lg}
 }
 
 // toolsForMode returns the subset of tc.Tools appropriate for the requested
@@ -105,6 +131,9 @@ func (hnd *Handler) HandleCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if hnd.log != nil {
+		hnd.log.CompleteCall(req.Model, "http")
+	}
 	resp, err := hnd.h.Complete(r.Context(), &req)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("completion error: %v", err), http.StatusInternalServerError)
@@ -220,6 +249,20 @@ func (hnd *Handler) HandleChat(w http.ResponseWriter, r *http.Request) {
 
 	req := &body.ChatRequest
 
+	// ── Logging ───────────────────────────────────────────────────────────────
+	var chatSession *logger.ChatSession
+	if hnd.log != nil {
+		chatID := logger.NewChatID()
+		var toolNames []string
+		if hnd.toolCfg != nil {
+			for _, t := range hnd.toolCfg.Tools {
+				toolNames = append(toolNames, t.Function.Name)
+			}
+		}
+		hnd.log.ChatSubmitted(chatID, req.Model, toolNames)
+		chatSession = hnd.log.NewHTTPSession(chatID, req.Model, toolNames, req.Stream)
+	}
+
 	// Resolve effective tools for this request.
 	effectiveTools := toolsForMode(hnd.toolCfg, body.ToolMode)
 	var effectiveTC *ToolConfig
@@ -235,22 +278,35 @@ func (hnd *Handler) HandleChat(w http.ResponseWriter, r *http.Request) {
 		if req.Stream {
 			if hnd.h.UsesInTextToolCalls(req.Model) {
 				// llamacpp: stream tokens live with lookahead detection.
-				hnd.handleStreamingToolLoop(w, r, req, effectiveTC)
+				hnd.handleStreamingToolLoop(w, r, req, effectiveTC, chatSession)
 			} else {
 				// OpenAI/Anthropic etc.: run tool turns synchronously, stream final answer.
-				hnd.handleStreamingNonLlamacpp(w, r, req, effectiveTC)
+				hnd.handleStreamingNonLlamacpp(w, r, req, effectiveTC, chatSession)
 			}
 			return
 		}
 
 		// Non-streaming: run full loop synchronously.
-		text, model, toolNames, err := hnd.runToolLoop(r.Context(), req, effectiveTC)
+		text, model, invokedTools, err := hnd.runToolLoop(r.Context(), req, effectiveTC)
 		if err != nil {
+			if chatSession != nil {
+				chatSession.Finish("error")
+			}
 			http.Error(w, fmt.Sprintf("chat error: %v", err), http.StatusInternalServerError)
 			return
 		}
-		if len(toolNames) > 0 {
-			w.Header().Set("X-Guido-Tools-Used", strings.Join(toolNames, ","))
+		if chatSession != nil {
+			// Token counts aren't surfaced by the synchronous tool loop, so estimate.
+			chatSession.MarkEstimated()
+			chatSession.RecordTurn(
+				lastUserInput(req.Messages), text,
+				estimatePromptTokens(req.Messages), logger.EstimateTokens(text),
+				invokedTools,
+			)
+			chatSession.Finish("stop")
+		}
+		if len(invokedTools) > 0 {
+			w.Header().Set("X-Guido-Tools-Used", strings.Join(invokedTools, ","))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		respBody := map[string]interface{}{
@@ -261,8 +317,8 @@ func (hnd *Handler) HandleChat(w http.ResponseWriter, r *http.Request) {
 				{"index": 0, "message": map[string]string{"role": "assistant", "content": text}, "finish_reason": "stop"},
 			},
 		}
-		if len(toolNames) > 0 {
-			respBody["guido_tool_calls"] = toolNames
+		if len(invokedTools) > 0 {
+			respBody["guido_tool_calls"] = invokedTools
 		}
 		json.NewEncoder(w).Encode(respBody)
 		return
@@ -270,13 +326,23 @@ func (hnd *Handler) HandleChat(w http.ResponseWriter, r *http.Request) {
 
 	// ── No tools: pass straight through ──────────────────────────────────────
 	if req.Stream {
-		hnd.handleChatStream(w, r, req)
+		hnd.handleChatStream(w, r, req, chatSession)
 		return
 	}
 	resp, err := hnd.h.Chat(r.Context(), req)
 	if err != nil {
+		if chatSession != nil {
+			chatSession.Finish("error")
+		}
 		http.Error(w, fmt.Sprintf("chat error: %v", err), http.StatusInternalServerError)
 		return
+	}
+	if chatSession != nil {
+		chatSession.RecordTurn(
+			lastUserInput(req.Messages), resp.Message.Content.PlainText(),
+			resp.PromptTokens, resp.TokensUsed, nil,
+		)
+		chatSession.Finish(resp.FinishReason)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -344,7 +410,7 @@ func (hnd *Handler) runToolLoop(ctx context.Context, req *harness.ChatRequest, t
 //
 // When no tools are actually invoked, the direct Chat() answer is returned as
 // a single-chunk SSE to avoid paying an extra model call.
-func (hnd *Handler) handleStreamingNonLlamacpp(w http.ResponseWriter, r *http.Request, req *harness.ChatRequest, tc *ToolConfig) {
+func (hnd *Handler) handleStreamingNonLlamacpp(w http.ResponseWriter, r *http.Request, req *harness.ChatRequest, tc *ToolConfig, sess *logger.ChatSession) {
 	ctx := r.Context()
 	history := make([]harness.ChatMessage, len(req.Messages))
 	copy(history, req.Messages)
@@ -372,6 +438,10 @@ func (hnd *Handler) handleStreamingNonLlamacpp(w http.ResponseWriter, r *http.Re
 				// Model answered directly without using any tools — return as-is.
 				// No extra model call: use the response we already have.
 				text := strings.TrimSpace(stripStopTokens(resp.Message.Content.PlainText()))
+				if sess != nil {
+					sess.RecordTurn(lastUserInput(req.Messages), text, resp.PromptTokens, resp.TokensUsed, nil)
+					sess.Finish(resp.FinishReason)
+				}
 				hnd.writeSSEText(w, resp.Model, text)
 				return
 			}
@@ -419,15 +489,26 @@ func (hnd *Handler) handleStreamingNonLlamacpp(w http.ResponseWriter, r *http.Re
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	flusher, _ := w.(http.Flusher)
+	var output strings.Builder
 	for token := range tokenChan {
 		cleaned := stripStopTokens(token)
 		if cleaned == "" {
 			break
 		}
+		output.WriteString(cleaned)
 		hnd.writeSSEChunk(w, req.Model, cleaned)
 		if flusher != nil {
 			flusher.Flush()
 		}
+	}
+	if sess != nil {
+		sess.MarkEstimated()
+		sess.RecordTurn(
+			lastUserInput(req.Messages), output.String(),
+			estimatePromptTokens(history), logger.EstimateTokens(output.String()),
+			toolsUsed,
+		)
+		sess.Finish("stop")
 	}
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	if flusher != nil {
@@ -442,7 +523,7 @@ func (hnd *Handler) handleStreamingNonLlamacpp(w http.ResponseWriter, r *http.Re
 // The X-Guido-Tools-Used header is set with all invoked tool names before the
 // first content token is written (headers are still writable at that point since
 // tool turns produce no body output).
-func (hnd *Handler) handleStreamingToolLoop(w http.ResponseWriter, r *http.Request, req *harness.ChatRequest, tc *ToolConfig) {
+func (hnd *Handler) handleStreamingToolLoop(w http.ResponseWriter, r *http.Request, req *harness.ChatRequest, tc *ToolConfig, sess *logger.ChatSession) {
 	const lookahead = len("TOOL_CALL:") // 10 chars
 
 	ctx := r.Context()
@@ -531,6 +612,15 @@ func (hnd *Handler) handleStreamingToolLoop(w http.ResponseWriter, r *http.Reque
 
 		if len(toolCalls) == 0 {
 			final := strings.TrimSpace(stripStopTokens(fullText))
+			if sess != nil {
+				sess.MarkEstimated()
+				sess.RecordTurn(
+					lastUserInput(req.Messages), final,
+					estimatePromptTokens(history), logger.EstimateTokens(final),
+					toolsUsed,
+				)
+				sess.Finish("stop")
+			}
 			history = append(history, harness.ChatMessage{
 				Role:    "assistant",
 				Content: harness.Text(final),
@@ -597,9 +687,12 @@ func (hnd *Handler) writeSSEText(w http.ResponseWriter, model, text string) {
 	}
 }
 
-func (hnd *Handler) handleChatStream(w http.ResponseWriter, r *http.Request, req *harness.ChatRequest) {
+func (hnd *Handler) handleChatStream(w http.ResponseWriter, r *http.Request, req *harness.ChatRequest, sess *logger.ChatSession) {
 	tokenChan, err := hnd.h.StreamChat(r.Context(), req)
 	if err != nil {
+		if sess != nil {
+			sess.Finish("error")
+		}
 		http.Error(w, fmt.Sprintf("streaming error: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -608,14 +701,19 @@ func (hnd *Handler) handleChatStream(w http.ResponseWriter, r *http.Request, req
 	w.Header().Set("Connection", "keep-alive")
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		if sess != nil {
+			sess.Finish("error")
+		}
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
+	var output strings.Builder
 	for token := range tokenChan {
 		cleaned := stripStopTokens(token)
 		if cleaned == "" {
 			break
 		}
+		output.WriteString(cleaned)
 		chunk := map[string]interface{}{
 			"object": "chat.completion.chunk",
 			"choices": []map[string]interface{}{
@@ -625,6 +723,15 @@ func (hnd *Handler) handleChatStream(w http.ResponseWriter, r *http.Request, req
 		data, _ := json.Marshal(chunk)
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
+	}
+	if sess != nil {
+		sess.MarkEstimated()
+		sess.RecordTurn(
+			lastUserInput(req.Messages), output.String(),
+			estimatePromptTokens(req.Messages), logger.EstimateTokens(output.String()),
+			nil,
+		)
+		sess.Finish("stop")
 	}
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()

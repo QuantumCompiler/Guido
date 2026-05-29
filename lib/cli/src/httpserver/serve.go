@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"guido/lib/cli/src/harness"
+	"guido/lib/cli/src/logger"
 )
 
 // corsMiddleware adds permissive CORS headers to every response.
@@ -46,7 +47,15 @@ func Serve(ctx context.Context, cfg *harness.Config, h *harness.Harness, tc *Too
 	r.Use(middleware.Recoverer)
 	r.Use(corsMiddleware)
 
-	hnd := NewHandler(h, tc)
+	lg, err := logger.New("")
+	if err != nil {
+		log.Printf("Warning: logging disabled: %v", err)
+	}
+	if lg != nil {
+		defer lg.Close()
+		lg.Info("server starting")
+	}
+	hnd := NewHandler(h, tc, lg)
 	r.Post("/v1/completions", hnd.HandleCompletion)
 	r.Post("/v1/chat/completions", hnd.HandleChat)
 	r.Get("/v1/models", hnd.HandleListModels)

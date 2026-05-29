@@ -21,6 +21,7 @@ import (
 	"guido/lib/cli/src/embeddedtools"
 	"guido/lib/cli/src/harness"
 	"guido/lib/cli/src/httpserver"
+	"guido/lib/cli/src/logger"
 	"guido/lib/cli/src/mcp"
 	"guido/lib/cli/src/tools"
 )
@@ -45,6 +46,8 @@ var (
 	contextImages  []string // --image
 )
 
+var appLogger *logger.Logger // global logger; nil if initialization failed
+
 var (
 	allBackends      bool   // --all-backends: initialize every configured backend (complete/chat)
 	serveModel       string // --model: which backend to serve (default: config default)
@@ -62,6 +65,12 @@ var rootCmd = &cobra.Command{
 	Short: "Guido - LLM Model Harness",
 	Long:  `Guido is a unified interface for interacting with local and cloud LLM models.`,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		if lg, err := logger.New(""); err == nil {
+			appLogger = lg
+		} else {
+			log.Printf("Warning: logging disabled: %v", err)
+		}
+
 		// Resolve tools directory — checked in priority order:
 		// 1. $GUIDO_TOOLS_DIR env var (explicit override)
 		// 2. exec/bin/guido-cpp-tools relative to CWD (dev/project layout)
@@ -158,6 +167,10 @@ var completeCmd = &cobra.Command{
 		activeTools, mcpReg := setupTools(ctx, cfg, useWeb, useMCP)
 		if mcpReg != nil {
 			defer mcpReg.Close()
+		}
+
+		if appLogger != nil {
+			appLogger.CompleteCall(chatModel, "cli")
 		}
 
 		history := []harness.ChatMessage{{Role: "user", Content: content}}
@@ -284,6 +297,21 @@ var chatCmd = &cobra.Command{
 			fmt.Println(strings.Join(labels, ", "))
 		}
 
+		// One interactive session = one chat file. Create it once; each user
+		// message below is recorded as a turn. The file is persisted after every
+		// turn, so a Ctrl+C exit still leaves a complete record.
+		var chatSession *logger.ChatSession
+		if appLogger != nil {
+			var toolNames []string
+			for _, t := range activeTools {
+				toolNames = append(toolNames, t.Function.Name)
+			}
+			chatID := logger.NewChatID()
+			chatSession = appLogger.NewChatSession(chatID, chatModel, toolNames, true)
+			chatSession.MarkEstimated()
+			defer chatSession.Finish("stop")
+		}
+
 		scanner := bufio.NewScanner(os.Stdin)
 		for {
 			fmt.Print("\nYou: ")
@@ -309,15 +337,29 @@ var chatCmd = &cobra.Command{
 			contextStrings, contextFiles, contextImages = nil, nil, nil
 			history = append(history, harness.ChatMessage{Role: "user", Content: content})
 
+			if chatSession != nil {
+				var toolNames []string
+				for _, t := range activeTools {
+					toolNames = append(toolNames, t.Function.Name)
+				}
+				appLogger.ChatSubmitted(chatSession.ChatID(), chatModel, toolNames)
+				chatSession.BeginTurn()
+			}
+
+			// Prompt tokens are estimated from the history sent to the model.
+			promptEst := estimatePromptTokens(history)
+
 			if len(activeTools) > 0 {
 				// ── Agentic tool-calling loop ──────────────────────────────
 				// finalPrefix="\nGuido: " is printed once, right before the
 				// final answer — whether it streams token-by-token or arrives
 				// as a single block. No re-print needed after the call returns.
-				_, err := runAgenticLoop(ctx, h, &history, chatModel, temperature, maxTokens, activeTools, mcpReg, true, "\nGuido: ")
+				answer, err := runAgenticLoop(ctx, h, &history, chatModel, temperature, maxTokens, activeTools, mcpReg, true, "\nGuido: ")
 				if err != nil {
 					log.Printf("Error: %v", err)
 					history = history[:len(history)-1] // undo user message
+				} else if chatSession != nil {
+					chatSession.RecordTurn(input, answer, promptEst, logger.EstimateTokens(answer), nil)
 				}
 			} else {
 				// ── Normal streaming path (no tools) ──────────────────────
@@ -354,6 +396,9 @@ var chatCmd = &cobra.Command{
 						Role:    "assistant",
 						Content: harness.Text(assistantText),
 					})
+				}
+				if chatSession != nil {
+					chatSession.RecordTurn(input, assistantText, promptEst, logger.EstimateTokens(assistantText), nil)
 				}
 			}
 		}
@@ -601,6 +646,17 @@ func setupTools(ctx context.Context, cfg *harness.Config, useWeb, useMCP bool) (
 		activeTools = append(activeTools, mcpReg.Tools()...)
 	}
 	return activeTools, mcpReg
+}
+
+// estimatePromptTokens approximates the prompt size of a message list for
+// logging when a streamed response carries no usage block.
+func estimatePromptTokens(msgs []harness.ChatMessage) int {
+	var b strings.Builder
+	for _, m := range msgs {
+		b.WriteString(m.Content.PlainText())
+		b.WriteByte('\n')
+	}
+	return logger.EstimateTokens(b.String())
 }
 
 // dispatchTool executes a single tool call, trying MCP first then built-ins.
@@ -860,6 +916,9 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 			}
 			providers[name] = backends.NewOpenAIBackend(bcfg.APIKey, modelName, bcfg.URL)
 			h.RegisterProvider(name, providers[name])
+			if appLogger != nil {
+				appLogger.ModelLoaded(name, modelName)
+			}
 
 		case "anthropic":
 			if bcfg.APIKey == "" {
@@ -871,6 +930,9 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 			}
 			providers[name] = backends.NewAnthropicBackend(bcfg.APIKey, modelName)
 			h.RegisterProvider(name, providers[name])
+			if appLogger != nil {
+				appLogger.ModelLoaded(name, modelName)
+			}
 
 		case "llamacpp":
 			if bcfg.URL == "" && bcfg.ModelPath == "" {
@@ -944,6 +1006,9 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 
 			providers[name] = backends.NewLlamaCppBackend(llamacppURL, modelName)
 			h.RegisterProvider(name, providers[name])
+			if appLogger != nil {
+				appLogger.ModelLoaded(name, modelName)
+			}
 
 		case "ollama":
 			modelName := bcfg.Model
@@ -952,6 +1017,9 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 			}
 			providers[name] = backends.NewOllamaBackend(modelName, bcfg.URL, os.ExpandEnv(bcfg.ModelPath))
 			h.RegisterProvider(name, providers[name])
+			if appLogger != nil {
+				appLogger.ModelLoaded(name, modelName)
+			}
 
 		case "mock":
 			modelName := bcfg.Model
@@ -960,6 +1028,9 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 			}
 			providers[name] = backends.NewMockBackend(modelName)
 			h.RegisterProvider(name, providers[name])
+			if appLogger != nil {
+				appLogger.ModelLoaded(name, modelName)
+			}
 
 		case "huggingface":
 			if bcfg.Model == "" {
@@ -971,6 +1042,9 @@ func initializeBackends(h *harness.Harness, cfg *harness.Config, tm *tools.Manag
 			}
 			providers[name] = backends.NewHuggingFaceBackend(bcfg.Model, cacheDir)
 			h.RegisterProvider(name, providers[name])
+			if appLogger != nil {
+				appLogger.ModelLoaded(name, bcfg.Model)
+			}
 		}
 	}
 
