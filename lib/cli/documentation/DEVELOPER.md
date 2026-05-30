@@ -193,9 +193,12 @@ func Serve(ctx context.Context, cfg *harness.Config, h *harness.Harness, tc *Too
 The guido binary resolves the tools directory at startup:
 
 1. `$GUIDO_TOOLS_DIR` — explicit override, useful for development or CI
-2. `exec/bin/guido-cpp-tools` relative to CWD — the standard dev layout when running from the project root
-3. `guido-cpp-tools/` adjacent to the binary — works for symlinked installs
-4. Embedded extraction — `tools.ExtractEmbedded(embeddedtools.ToolsFS, "~/.guido/tools/")` — active only in binaries built with `-tags embed_tools`; no-op in regular builds
+2. `~/.guido/tools/bin/` — installed by `make install`; the preferred runtime location. All `guido-cpp-tools` executables are copied here so guido can reference them from any working directory
+3. `exec/bin/guido-cpp-tools` relative to CWD — the standard dev layout when running from the project root
+4. `guido-cpp-tools/` adjacent to the binary — works for symlinked installs
+5. Embedded extraction — `tools.ExtractEmbedded(embeddedtools.ToolsFS, "~/.guido/tools/")` — active only in binaries built with `-tags embed_tools`; no-op in regular builds
+
+`~/.guido/tools/bin/` is the intended stable location for all guido-managed executables. Future internal tool abstractions (e.g. simplified wrappers around complex llama.cpp commands) should be placed here so they are available to the guido binary regardless of where it is invoked from. `/usr/local/bin` symlinks are kept separately for user-facing system-wide access.
 
 ### Embedded dylibs and rpath
 

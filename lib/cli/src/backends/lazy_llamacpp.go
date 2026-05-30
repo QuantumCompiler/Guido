@@ -213,6 +213,17 @@ func (lb *LazyLlamaCppBackend) load(done chan struct{}) {
 	}
 }
 
+// Unload stops the backend's guido-server process immediately and resets state
+// to unloaded. Safe to call from outside the package (e.g. on a model switch).
+// A subsequent request will trigger a fresh EnsureLoaded.
+func (lb *LazyLlamaCppBackend) Unload() {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	if lb.state == lazyReady || lb.state == lazyLoading {
+		lb.unload()
+	}
+}
+
 // unload stops the server and resets state. Caller must hold lb.mu.
 func (lb *LazyLlamaCppBackend) unload() {
 	log.Printf("[guido] unloading model %q after %s idle", lb.model, lb.idleTimeout)

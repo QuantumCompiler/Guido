@@ -17,12 +17,15 @@ A unified Go-based harness for local and cloud LLM models. Run a single model fr
 ```bash
 cd lib/cli
 make build    # compile llama.cpp → stage tools → build self-contained guido binary
-make install  # build + copy config to ~/.guido/config/ + /usr/local/bin symlinks
+make install  # build + copy config + install tools to ~/.guido/tools/bin/ + /usr/local/bin symlinks
 ```
 
 `make build` produces a single self-contained binary at `exec/bin/guido`. The binary has all llama.cpp tools (`guido-server`, `guido-cli`, `guido-quantize`, and shared libraries) baked directly inside using Go's `//go:embed`. On the first run in a new location it silently extracts them to `~/.guido/tools/`; subsequent runs skip extraction.
 
-`make install` places the binary at `~/bin/guido` and writes a starter config to `~/.guido/config/config.yaml` (skipped if the file already exists). It also creates `/usr/local/bin` symlinks for `guido` and every tool in `exec/bin/guido-cpp-tools/`.
+`make install` does three things:
+- Writes a starter config to `~/.guido/config/config.yaml` (skipped if it already exists)
+- Copies all tools from `exec/bin/guido-cpp-tools/` to **`~/.guido/tools/bin/`** — the stable runtime location guido uses to find its tools from any working directory
+- Creates `/usr/local/bin` symlinks for `guido` and every tool in `guido-cpp-tools/` for system-wide access
 
 ### Configure
 

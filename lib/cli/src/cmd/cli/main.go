@@ -75,13 +75,19 @@ var rootCmd = &cobra.Command{
 		}
 
 		// Resolve tools directory — checked in priority order:
+		// Tools resolution order:
 		// 1. $GUIDO_TOOLS_DIR env var (explicit override)
-		// 2. exec/bin/guido-cpp-tools relative to CWD (dev/project layout)
-		// 3. guido-cpp-tools adjacent to the installed binary
-		// 4. Embedded tools baked into the binary (embed_tools build tag)
+		// 2. ~/.guido/tools/bin/ (installed by make install — preferred at runtime)
+		// 3. exec/bin/guido-cpp-tools relative to CWD (dev/project layout)
+		// 4. guido-cpp-tools adjacent to the installed binary (dev symlink layout)
+		// 5. Embedded tools baked into the binary (embed_tools build tag)
 		var err error
 		if toolsDir := os.Getenv("GUIDO_TOOLS_DIR"); toolsDir != "" {
 			toolMgr, err = tools.NewManagerFromDir(toolsDir)
+		} else if installedDir := filepath.Join(os.Getenv("HOME"), ".guido", "tools", "bin"); func() bool {
+			_, e := os.Stat(installedDir); return e == nil
+		}() {
+			toolMgr, err = tools.NewManagerFromDir(installedDir)
 		} else if _, statErr := os.Stat("exec/bin/guido-cpp-tools"); statErr == nil {
 			toolMgr, err = tools.NewManagerFromDir("exec/bin/guido-cpp-tools")
 		} else if exePath, exeErr := os.Executable(); exeErr == nil {
@@ -245,13 +251,24 @@ var chatCmd = &cobra.Command{
 			log.Fatalf("Failed to load config: %v", err)
 		}
 
-		// Narrow to the requested backend (default: models.default from config).
-		// --all-backends opts out of filtering so every configured backend is available.
-		filterBackends(cfg, model, allBackends)
+		// Load ALL configured backends so the user can switch models mid-session
+		// with /model <name>. llamacpp backends are initialized lazily so only the
+		// active model's server starts until it's actually needed. Non-llamacpp
+		// backends (OpenAI, Anthropic, etc.) are cheap to register regardless.
+		// If --model was specified, validate it exists but don't filter others out.
+		if model != "" {
+			if _, ok := cfg.Backends[model]; !ok {
+				var names []string
+				for k := range cfg.Backends {
+					names = append(names, k)
+				}
+				log.Fatalf("Backend %q not found in config. Available: %v", model, names)
+			}
+		}
 
 		// Initialize harness
 		h := harness.NewHarness(cfg)
-		providers := initializeBackends(h, cfg, toolMgr, false)
+		providers := initializeBackends(h, cfg, toolMgr, true) // lazy=true for all
 		if len(providers) == 0 {
 			log.Fatal("No backends configured")
 		}
@@ -262,10 +279,40 @@ var chatCmd = &cobra.Command{
 		router := harness.NewSimpleRouter(cfg, providers)
 		h.SetRouter(router)
 
-		// Resolve model name
+		// Resolve initial model name.
 		chatModel := model
 		if chatModel == "" {
 			chatModel = cfg.Models.Default
+		}
+
+		// switchModel unloads the current model (if it is a lazy llamacpp backend)
+		// and loads the new one. Keeping both resident at once wastes VRAM/RAM, so
+		// the old server is stopped before the new one starts.
+		type unloader interface{ Unload() }
+		type loader interface{ EnsureLoaded(context.Context) error }
+		switchModel := func(ctx context.Context, from, to string) bool {
+			// Unload the previous model first.
+			if from != "" {
+				if prev, err := router.Route(from); err == nil {
+					if ul, ok := prev.(unloader); ok {
+						fmt.Printf("[guido] unloading model %s...\n", from)
+						ul.Unload()
+					}
+				}
+			}
+			// Load the new model.
+			next, err := router.Route(to)
+			if err != nil {
+				return false
+			}
+			if ll, ok := next.(loader); ok {
+				fmt.Printf("[guido] loading model %s...\n", to)
+				if err := ll.EnsureLoaded(ctx); err != nil {
+					log.Printf("Failed to load model %q: %v", to, err)
+					return false
+				}
+			}
+			return true
 		}
 
 		// Build conversation history
@@ -310,6 +357,10 @@ var chatCmd = &cobra.Command{
 			cancel()
 			os.Exit(0)
 		}()
+
+		// Eagerly load the initial model so the first message isn't slow.
+		// Pass empty string for "from" — nothing to unload on first start.
+		switchModel(ctx, "", chatModel)
 
 		// Decide which tool sets to activate based on flags.
 		useWeb, useMCP := resolveToolMode()
@@ -386,6 +437,50 @@ var chatCmd = &cobra.Command{
 			if input == "exit" || input == "quit" || input == "/exit" || input == "/quit" {
 				fmt.Println("Goodbye!")
 				break
+			}
+
+			// /models — list all available backends
+			if input == "/models" {
+				fmt.Println("Available models:")
+				for name := range cfg.Backends {
+					marker := ""
+					if name == chatModel {
+						marker = " (active)"
+					}
+					fmt.Printf("  %s%s\n", name, marker)
+				}
+				continue
+			}
+
+			// /model <name> — switch to a different model, carrying history forward
+			if strings.HasPrefix(input, "/model ") {
+				target := strings.TrimSpace(strings.TrimPrefix(input, "/model "))
+				if target == "" {
+					fmt.Printf("Current model: %s\n", chatModel)
+					continue
+				}
+				if target == chatModel {
+					fmt.Printf("Already using %s.\n", chatModel)
+					continue
+				}
+				if _, routeErr := router.Route(target); routeErr != nil {
+					fmt.Printf("Unknown model %q. Use /models to list available models.\n", target)
+					continue
+				}
+				if !switchModel(ctx, chatModel, target) {
+					continue
+				}
+				prev := chatModel
+				chatModel = target
+				fmt.Printf("Switched from %s to %s. Conversation history carried over (%d messages).\n",
+					prev, chatModel, len(history))
+				continue
+			}
+
+			// /model (no argument) — show current model
+			if input == "/model" {
+				fmt.Printf("Current model: %s\n", chatModel)
+				continue
 			}
 
 			// Add user message to history

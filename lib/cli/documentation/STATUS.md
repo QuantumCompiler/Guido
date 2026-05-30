@@ -18,6 +18,7 @@
 - Create ability to switch models during a chat session and automatically migrate conversation history to new model's context window
 
 ## To Do:
+- Change default log for chats / completions / etc to be date and time with nothing else. Keep all other things about logs, just the way we write the file name by default.
 - Discover if we can monitor context window usage for chats
     - If possible, we need to set context limits on a per-model basis and warn users when they're approaching the limit
     - At a certain threshold, if possible, we need to be able to compact conversation history to free up context space while preserving as much relevant information as possible

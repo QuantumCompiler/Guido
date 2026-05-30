@@ -35,8 +35,13 @@ for SCRIPT_PAIR in "${SCRIPTS[@]}"; do
     # Create wrapper script
     cat > "$WRAPPER_PATH" << 'WRAPPER_TEMPLATE'
 #!/bin/bash
-# Auto-generated wrapper for llama.cpp Python script
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Auto-generated wrapper for llama.cpp Python script.
+# Resolves symlinks so this works correctly when invoked from /usr/local/bin.
+_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$_SOURCE" ]; do
+    _SOURCE="$(readlink "$_SOURCE")"
+done
+SCRIPT_DIR="$(cd "$(dirname "$_SOURCE")" && pwd)"
 # Wrapper lives at exec/bin/guido-cpp-tools/ — three levels up then into modules/
 LLAMA_DIR="$(cd "$SCRIPT_DIR/../../../modules/llama.cpp" && pwd)"
 SCRIPT_NAME="PLACEHOLDER_SCRIPT"

@@ -30,6 +30,7 @@ BIN_DIR     := exec/bin
 SCRIPTS_DIR := exec/scripts
 MODULES_DIR := modules
 CONFIG_DIR  := $(HOME)/.guido/config
+TOOLS_DIR   := $(HOME)/.guido/tools/bin
 INSTALL_DIR := $(HOME)/bin
 SYMLINK_DIR := /usr/local/bin
 
@@ -52,7 +53,7 @@ help:
 	@echo "  stage-embed     Copy compiled tools into src/embeddedtools/data/ for embedding"
 	@echo "  build-embedded  stage-embed + build self-contained binary (-tags embed_tools)"
 	@echo "  clean           Clean build artifacts"
-	@echo "  install         Build + copy config + create symlinks in $(SYMLINK_DIR)"
+	@echo "  install         Build + copy config + install tools to ~/.guido/tools/bin/ + create symlinks in $(SYMLINK_DIR)"
 	@echo "  symlinks        (Re)create /usr/local/bin symlinks without rebuilding"
 	@echo "  test            Run tests"
 	@echo ""
@@ -108,7 +109,7 @@ build-embedded: stage-embed
 	@echo "✓ Self-contained binary built: $(BIN_DIR)/guido"
 	@echo "  (llama.cpp tools are embedded — no external dependencies needed)"
 
-# Install binary, config, and /usr/local/bin symlinks
+# Install binary, config, tools, and /usr/local/bin symlinks
 install: build
 	@echo "── Config ───────────────────────────────────────────────"
 	@mkdir -p "$(CONFIG_DIR)"
@@ -118,6 +119,16 @@ install: build
 		cp config.yaml "$(CONFIG_DIR)/config.yaml"; \
 		echo "  ✓ config → $(CONFIG_DIR)/config.yaml"; \
 	fi
+	@echo "── Tools → $(TOOLS_DIR) ─────────────────────────────────"
+	@mkdir -p "$(TOOLS_DIR)"
+	@for tool in "$(CURDIR)/$(GUIDO_TOOLS_DIR)"/*; do \
+		name=$$(basename "$$tool"); \
+		cp "$$tool" "$(TOOLS_DIR)/$$name"; \
+		chmod +x "$(TOOLS_DIR)/$$name"; \
+		echo "  ✓ $$name"; \
+	done
+	@echo ""
+	@echo "✓ Tools installed to $(TOOLS_DIR)/"
 	@$(MAKE) --no-print-directory symlinks
 
 # Create (or refresh) /usr/local/bin symlinks for every executable in exec/bin/.
@@ -138,6 +149,7 @@ symlinks:
 	@echo "✓ Installation complete!"
 	@echo ""
 	@echo "Config:    $(CONFIG_DIR)/config.yaml"
+	@echo "Tools:     $(TOOLS_DIR)/"
 	@echo "Symlinks:  $(SYMLINK_DIR)/guido, guido-server, ..."
 	@echo ""
 	@echo "To use:"
