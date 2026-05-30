@@ -1,4 +1,10 @@
-# Guido — LLM Harness
+# Guido — The All In One LLM Tool
+
+<div align="center">
+
+![Guido](ref/Guido.jpg)
+
+</div>
 
 A unified Go-based harness for local and cloud LLM models. Run a single model from the command line, start a persistent OpenAI-compatible HTTP server, or use it as a library — all from one binary with embedded llama.cpp tooling.
 
@@ -136,9 +142,25 @@ guido chat --image diagram.png --file architecture.md
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--system` | `-s` | | System prompt injected as the first message |
+| `--resume` | | | Resume a saved chat by id or file name (from `logs/chats/`) |
+| `--continue` | `-c` | | Resume the most recent saved chat |
 | `--search` | | | Web search tools only |
 | `--mcp` | | | MCP tools only |
 | `--native` | | | No tools |
+
+#### Resuming a conversation
+
+Every chat is logged to a JSON file under `~/.guido/logs/chats/`. You can pick up
+a previous conversation in a later run — Guido rebuilds the prior turns into the
+model's context and appends new turns to the same file:
+
+```bash
+guido chat --continue                          # resume the most recent chat
+guido chat --resume llama3.3-05-30-2026:14-23-09   # resume a specific chat
+```
+
+Resuming works by either the chat's current file name or its original id, so a
+[renamed chat](#renaming-chats) is still resumable by its id.
 
 ---
 
@@ -536,6 +558,111 @@ Or via the API using OpenAI-compatible `image_url` content parts (data URIs supp
 
 ---
 
+## Logging
+
+Guido writes two kinds of logs under `~/.guido/logs/`: a human-readable
+operational `.log` and detailed per-interaction JSON files.
+
+### Log directory layout
+
+```
+~/.guido/logs/
+├── main/                              # operational .log files (one per day)
+│   └── guido-2026-05-30.log
+├── chats/                             # interactive `guido chat` sessions
+│   └── llama3.3-05-30-2026:14-23-09.json
+├── http/                              # /v1/chat/completions requests
+│   └── llama3.3-05-30-2026:14-25-11.json
+└── completions/                       # `guido complete` and /v1/completions
+    └── qwen35-05-30-2026:14-26-02.json
+```
+
+Each interaction type is written to its own directory:
+
+- `chats/` — interactive CLI chat sessions (one file per session, many turns)
+- `http/` — `/v1/chat/completions` server requests (one file per request)
+- `completions/` — one-shot `guido complete` runs and `/v1/completions` requests
+
+### Operational log (`main/`)
+
+A human-readable `.log` capturing lifecycle events: model loads, chat
+submissions, model responses, completions, and errors. One file per day.
+
+```
+2026-05-30T03:18:10Z [INFO] model loaded: backend=llama33 model=llama3.3
+2026-05-30T03:19:12Z [INFO] user chat submitted to model=llama3.3 id=llama3.3-05-30-2026:03-19-12 tools=[web_search,fetch_url]
+2026-05-30T03:19:18Z [INFO] model=llama3.3 responded prompt_tokens=200 (estimated) completion_tokens=300 (estimated) latency=6000ms id=llama3.3-05-30-2026:03-19-12
+```
+
+A `model responded` line is emitted per turn. Token counts marked `(estimated)`
+were derived heuristically (~4 characters per token) because the response was
+streamed and the backend did not surface a usage block; non-streaming responses
+report the backend's exact counts.
+
+### File naming
+
+Each JSON file is named `<model>-MM-DD-YYYY:HH-MM-SS.json`, using the model name
+and the UTC time the interaction started. The model name is sanitized so any
+character outside `[A-Za-z0-9._-]` becomes `-` (e.g. `org/model` → `org-model`).
+
+> **Note:** names have second-level granularity, so two interactions of the same
+> model started within the same second can collide on file name. This is
+> effectively impossible for the interactive CLI (one session = one file) but
+> possible for the HTTP server under concurrent load.
+
+### Per-interaction metrics
+
+Each file represents a single interaction and records every turn — the user
+input, model output, token usage, and timestamps:
+
+```json
+{
+  "chat_id": "llama3.3-05-30-2026:14-23-09",
+  "custom_name": "",
+  "model": "llama3.3",
+  "started_at": "2026-05-30T14:23:09.123Z",
+  "ended_at": "2026-05-30T14:23:21.456Z",
+  "duration_ms": 12333,
+  "available_tools": ["web_search", "fetch_url"],
+  "streaming": true,
+  "finish_reason": "stop",
+  "estimated": true,
+  "turns": [
+    {
+      "user_input": "What is the capital of France?",
+      "model_output": "The capital of France is Paris.",
+      "prompt_tokens": 8,
+      "completion_tokens": 8,
+      "total_tokens": 16,
+      "invoked_tools": ["web_search"],
+      "sent_at": "2026-05-30T14:23:09.124Z",
+      "responded_at": "2026-05-30T14:23:15.500Z"
+    }
+  ]
+}
+```
+
+The file is persisted after every turn, so an interactive session leaves a
+complete record even if the process is interrupted (e.g. Ctrl+C).
+
+### Resuming chats
+
+Because each chat file stores every turn's `user_input` and `model_output`, a
+chat can be replayed back into the model's context with `--continue` or
+`--resume` — see [Resuming a conversation](#resuming-a-conversation).
+
+### Renaming chats
+
+Chat metadata includes a `custom_name` field, empty by default — in which case
+the file uses the default `<model>-<date>.json` name. When a chat is given a
+custom name, its JSON file is renamed to `<custom_name>.json`, the `custom_name`
+field is set, and the original `chat_id` is preserved — so the system-generated
+name is never lost and the chat remains resumable by its id. Renaming again moves
+the file again; renaming onto a name that already exists is rejected to avoid
+overwriting another chat.
+
+---
+
 ## Architecture
 
 ```
@@ -553,6 +680,7 @@ lib/cli/
 │   ├── tools/             # guido-server lifecycle, built-in tool calling, and embedded extraction
 │   ├── embeddedtools/     # Go embed staging — populated by make stage-embed, gitignored
 │   ├── mcp/               # MCP client (stdio, HTTP+SSE, Streamable HTTP transports)
+│   ├── logger/            # Structured logging (operational .log + per-interaction JSON metrics)
 │   └── cmd/
 │       └── cli/main.go    # guido CLI (complete, chat, serve, harness, models)
 │

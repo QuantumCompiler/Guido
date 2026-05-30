@@ -23,6 +23,7 @@ lib/cli/
 │   ├── tools/          — guido-server lifecycle, built-in tool calling, embedded extraction
 │   ├── embeddedtools/  — //go:embed staging package (data/ populated by make stage-embed; gitignored)
 │   ├── mcp/            — MCP client (stdio, HTTP+SSE, Streamable HTTP transports)
+│   ├── logger/         — structured logging (operational .log + per-interaction JSON metrics)
 │   └── cmd/            — Binary entry point
 │       └── cli/        — guido binary (all subcommands: complete, chat, serve, harness, models)
 │
@@ -308,6 +309,97 @@ type Transport interface {
 
 ---
 
+## `src/logger/` — structured logging
+
+The `logger` package writes two kinds of output: a daily operational `.log` and
+per-interaction JSON files, organized into subdirectories by interaction type.
+
+| File | Purpose |
+|------|---------|
+| `logger.go` | `Logger` (operational log + directory management), `ChatSession` (per-interaction metrics), `ChatMetrics` / `TurnRecord` (JSON schema), chat-id generation, token estimation, and resume/rename helpers |
+
+### Directory layout
+
+`logger.New(logDir)` creates four subdirectories under the log root (default
+`~/.guido/logs/`) and routes output accordingly:
+
+- `main/` — daily operational `.log` files (`guido-YYYY-MM-DD.log`)
+- `chats/` — interactive CLI chat sessions (`NewChatSession`)
+- `http/` — `/v1/chat/completions` requests (`NewHTTPSession`)
+- `completions/` — `guido complete` and `/v1/completions` (`NewCompletionSession`)
+
+### Operational log
+
+`Logger.write` appends timestamped lines to the current day's file under `main/`.
+Helper methods wrap common events:
+
+- `ModelLoaded(backend, model)`
+- `ChatSubmitted(chatID, model, tools)` — leads with the model; id and tools at the end
+- `ModelResponded(chatID, model, promptTokens, completionTokens, latencyMs, estimated)` — one line per turn
+- `CompleteCall(model, source)`
+- `Error(context, err)`
+
+### Per-interaction metrics
+
+`ChatSession` accumulates metrics and persists a JSON file after each turn. The
+three constructors differ only in their target directory:
+
+```go
+sess := logger.NewChatSession(chatID, model, tools, streaming)   // chats/
+// or NewHTTPSession / NewCompletionSession
+
+sess.BeginTurn()                                                 // stamp sent_at (optional)
+sess.MarkEstimated()                                             // flag heuristic token counts
+sess.RecordTurn(userInput, modelOutput, promptTokens, completionTokens, invokedTools)
+sess.Finish("stop")
+```
+
+Each `TurnRecord` captures `user_input`, `model_output`, token counts,
+`invoked_tools`, and `sent_at` / `responded_at` timestamps. `RecordTurn` also
+emits the operational `model responded` line and calls `persist()`, so the file
+on disk stays current even if the process exits before `Finish`.
+
+`ChatMetrics` carries the chat-level fields: `chat_id`, `custom_name`, `model`,
+`started_at` / `ended_at`, `available_tools`, `streaming`, `finish_reason`,
+`estimated`, and the `turns` array.
+
+### File naming and the `chat_id` / `custom_name` split
+
+`NewChatID(model)` returns `<sanitizedModel>-MM-DD-YYYY:HH-MM-SS` (Go layout
+`01-02-2006:15-04-05`, UTC). `sanitizeForFilename` replaces any character outside
+`[A-Za-z0-9._-]` with `-`.
+
+The on-disk file name is `(*ChatMetrics).fileName()`, which returns `CustomName`
+if set, otherwise `ChatID`. `chat_id` always retains the original generated name,
+so it is never lost when a chat is renamed.
+
+Because second-level timestamps can collide, two interactions of the same model
+started within the same second can map to the same file — effectively impossible
+for the interactive CLI (one session = one file) but possible for the HTTP server
+under concurrent load.
+
+### Resuming and renaming
+
+- `LoadChat(name)` resolves a chat by its current file name, falling back to a
+  scan by `chat_id` (so renamed chats remain findable by their original id).
+- `ListChats()` / `LatestChat()` sort by the `started_at` field, not the file
+  name — so the id/name format does not affect ordering or `--continue`.
+- `ResumeChatSession(metrics, tools, streaming)` reopens a chat so new turns
+  append to its existing file (preserving `chat_id`, `custom_name`, and
+  `started_at`). Backs `guido chat --resume` / `--continue`.
+- `RenameChat(currentName, newName)` sanitizes `newName`, writes the JSON under
+  `<newName>.json`, removes the old file, sets `custom_name`, and preserves
+  `chat_id`. It rejects collisions and is a no-op when the name is unchanged.
+
+### Token estimation
+
+`EstimateTokens(s)` approximates `len(s)/4` tokens. Streaming paths can't read a
+usage block, so they estimate prompt/completion tokens and call `MarkEstimated()`
+(reflected as `"estimated": true` in JSON and `(estimated)` in the `.log`).
+Non-streaming responses use the backend's exact counts.
+
+---
+
 ## `src/cmd/cli/` — `guido` binary
 
 Single `main.go` that uses `cobra` to expose five subcommands. All tool-related logic is centralized in package-level helpers so the three commands that support tools (`complete`, `chat`, `serve`) share identical behavior.
@@ -316,8 +408,8 @@ Single `main.go` that uses `cobra` to expose five subcommands. All tool-related 
 
 | Command | Behavior |
 |---------|----------|
-| `complete <prompt>` | One-shot prompt → response. Runs the agentic loop when tools are active, streams directly when they are not |
-| `chat` | Interactive multi-turn session. Agentic loop when tools active, streaming otherwise |
+| `complete <prompt>` | One-shot prompt → response. Runs the agentic loop when tools are active, streams directly when they are not. Logs a per-run JSON file to `logs/completions/` |
+| `chat` | Interactive multi-turn session. Agentic loop when tools active, streaming otherwise. Logs one JSON file per session to `logs/chats/`. Supports `--resume`/`--continue` to reload a prior chat into context |
 | `serve` | Persistent HTTP server with lazy-loading backends. Passes tool config to the HTTP handler |
 | `harness` | Bare HTTP server — all backends, lazy loading, no tool injection. Replacement for the former `guido-harness` binary. Accepts `--llama-port` and `--llama-gpu-layers` to override defaults for embedded backends |
 | `models` | Lists all models from all configured backends |

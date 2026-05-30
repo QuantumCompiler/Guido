@@ -38,6 +38,9 @@ var (
 	flagMCP    bool // --mcp    : MCP tools only
 	flagNative bool // --native : no tools
 	toolMgr    *tools.Manager
+
+	flagResume   string // --resume   : resume a saved chat by id (from logs/chats/)
+	flagContinue bool   // --continue : resume the most recent saved chat
 )
 
 var (
@@ -169,19 +172,37 @@ var completeCmd = &cobra.Command{
 			defer mcpReg.Close()
 		}
 
+		var toolNames []string
+		for _, t := range activeTools {
+			toolNames = append(toolNames, t.Function.Name)
+		}
+
+		var completion *logger.ChatSession
 		if appLogger != nil {
 			appLogger.CompleteCall(chatModel, "cli")
+			completion = appLogger.NewCompletionSession(logger.NewChatID(chatModel), chatModel, toolNames, true)
+			completion.MarkEstimated()
 		}
 
 		history := []harness.ChatMessage{{Role: "user", Content: content}}
+		promptEst := estimatePromptTokens(history)
 
 		if len(activeTools) > 0 {
 			// Agentic loop — run until the model gives a final answer.
 			// Pass "" as finalPrefix: the loop prints the answer directly with
 			// no label (complete is a one-shot command, no "Guido:" needed).
-			_, err := runAgenticLoop(ctx, h, &history, chatModel, temperature, maxTokens, activeTools, mcpReg, true, "")
+			answer, err := runAgenticLoop(ctx, h, &history, chatModel, temperature, maxTokens, activeTools, mcpReg, true, "")
 			if err != nil {
+				if completion != nil {
+					completion.Finish("error")
+				}
 				log.Fatalf("Completion error: %v", err)
+			}
+			if completion != nil {
+				// invoked_tools not surfaced from runAgenticLoop; record nil
+				// (consistent with HTTP and the no-tools path).
+				completion.RecordTurn(prompt, answer, promptEst, logger.EstimateTokens(answer), nil)
+				completion.Finish("stop")
 			}
 		} else {
 			// No tools — stream the response directly.
@@ -194,12 +215,22 @@ var completeCmd = &cobra.Command{
 			}
 			resp, err := h.StreamChat(ctx, req)
 			if err != nil {
+				if completion != nil {
+					completion.Finish("error")
+				}
 				log.Fatalf("Completion error: %v", err)
 			}
+			var out strings.Builder
 			for token := range resp {
-				fmt.Print(stripStopTokens(token))
+				cleaned := stripStopTokens(token)
+				out.WriteString(cleaned)
+				fmt.Print(cleaned)
 			}
 			fmt.Println()
+			if completion != nil {
+				completion.RecordTurn(prompt, out.String(), promptEst, logger.EstimateTokens(out.String()), nil)
+				completion.Finish("stop")
+			}
 		}
 	},
 }
@@ -241,6 +272,32 @@ var chatCmd = &cobra.Command{
 		var history []harness.ChatMessage
 		if systemPrompt != "" {
 			history = append(history, harness.ChatMessage{Role: "system", Content: harness.Text(systemPrompt)})
+		}
+
+		// Resume a previous chat into context: rebuild its turns as history so the
+		// model continues where it left off. --resume <id> loads a specific chat;
+		// --continue (-c) loads the most recent saved chat. resumedChat stays in
+		// scope so the session below appends new turns to the same JSON file.
+		var resumedChat *logger.ChatMetrics
+		if appLogger != nil && (flagResume != "" || flagContinue) {
+			var rerr error
+			if flagResume != "" {
+				resumedChat, rerr = appLogger.LoadChat(flagResume)
+			} else {
+				resumedChat, rerr = appLogger.LatestChat()
+			}
+			if rerr != nil {
+				log.Fatalf("Error resuming chat: %v", rerr)
+			}
+			for _, t := range resumedChat.Turns {
+				if t.UserInput != "" {
+					history = append(history, harness.ChatMessage{Role: "user", Content: harness.Text(t.UserInput)})
+				}
+				if t.ModelOutput != "" {
+					history = append(history, harness.ChatMessage{Role: "assistant", Content: harness.Text(t.ModelOutput)})
+				}
+			}
+			fmt.Printf("Resumed chat %s — %d prior turn(s) loaded into context.\n", resumedChat.ChatID, len(resumedChat.Turns))
 		}
 
 		// Handle Ctrl+C gracefully — finish the current response then exit
@@ -306,8 +363,12 @@ var chatCmd = &cobra.Command{
 			for _, t := range activeTools {
 				toolNames = append(toolNames, t.Function.Name)
 			}
-			chatID := logger.NewChatID()
-			chatSession = appLogger.NewChatSession(chatID, chatModel, toolNames, true)
+			if resumedChat != nil {
+				// Continue the resumed chat: new turns append to its existing file.
+				chatSession = appLogger.ResumeChatSession(resumedChat, toolNames, true)
+			} else {
+				chatSession = appLogger.NewChatSession(logger.NewChatID(chatModel), chatModel, toolNames, true)
+			}
 			chatSession.MarkEstimated()
 			defer chatSession.Finish("stop")
 		}
@@ -359,6 +420,9 @@ var chatCmd = &cobra.Command{
 					log.Printf("Error: %v", err)
 					history = history[:len(history)-1] // undo user message
 				} else if chatSession != nil {
+					// invoked_tools is not surfaced from runAgenticLoop; record nil
+					// (consistent with the no-tools path and HTTP streaming paths
+					// which track tools per-turn internally).
 					chatSession.RecordTurn(input, answer, promptEst, logger.EstimateTokens(answer), nil)
 				}
 			} else {
@@ -377,6 +441,9 @@ var chatCmd = &cobra.Command{
 				if err != nil {
 					log.Printf("Error: %v", err)
 					history = history[:len(history)-1]
+					if chatSession != nil {
+						chatSession.RecordTurn(input, "", promptEst, 0, nil)
+					}
 					continue
 				}
 
@@ -1072,6 +1139,8 @@ func init() {
 	chatCmd.Flags().Float32VarP(&temperature, "temperature", "t", 0.7, "Temperature for sampling")
 	chatCmd.Flags().IntVarP(&maxTokens, "max-tokens", "n", -1, "Maximum tokens to generate (-1 for unlimited)")
 	chatCmd.Flags().StringVarP(&systemPrompt, "system", "s", "", "System prompt to set the assistant's behavior")
+	chatCmd.Flags().StringVar(&flagResume, "resume", "", "Resume a saved chat by id (from logs/chats/)")
+	chatCmd.Flags().BoolVarP(&flagContinue, "continue", "c", false, "Resume the most recent saved chat")
 
 	completeCmd.Flags().StringArrayVar(&contextStrings, "context", nil, "Raw string to inject as context before the prompt")
 	completeCmd.Flags().StringArrayVar(&contextFiles, "file", nil, "File to attach (text files injected as text, images base64-encoded)")
@@ -1111,7 +1180,7 @@ type llamaStatus int
 const (
 	serverNotRunning llamaStatus = iota
 	serverReady
-	serverLoading   // alive but model not yet fully loaded (503)
+	serverLoading // alive but model not yet fully loaded (503)
 	serverWrongModel
 )
 

@@ -65,7 +65,7 @@ func stripStopTokens(s string) string {
 // Handler handles HTTP requests backed by a harness instance.
 type Handler struct {
 	h       *harness.Harness
-	toolCfg *ToolConfig  // nil when no server-side tools are configured
+	toolCfg *ToolConfig    // nil when no server-side tools are configured
 	log     *logger.Logger // nil → logging disabled
 }
 
@@ -131,13 +131,25 @@ func (hnd *Handler) HandleCompletion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var completion *logger.ChatSession
 	if hnd.log != nil {
 		hnd.log.CompleteCall(req.Model, "http")
+		completion = hnd.log.NewCompletionSession(logger.NewChatID(req.Model), req.Model, nil, false)
 	}
 	resp, err := hnd.h.Complete(r.Context(), &req)
 	if err != nil {
+		if completion != nil {
+			completion.Finish("error")
+		}
 		http.Error(w, fmt.Sprintf("completion error: %v", err), http.StatusInternalServerError)
 		return
+	}
+	if completion != nil {
+		// CompletionResponse has real completion tokens but no prompt token count,
+		// so the prompt is estimated. Mark estimated so the JSON reflects this.
+		completion.MarkEstimated()
+		completion.RecordTurn(req.Prompt, resp.Text, logger.EstimateTokens(req.Prompt), resp.TokensUsed, nil)
+		completion.Finish(resp.FinishReason)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -156,8 +168,18 @@ func (hnd *Handler) HandleCompletion(w http.ResponseWriter, r *http.Request) {
 
 // handleCompletionStream streams a text completion as OpenAI SSE.
 func (hnd *Handler) handleCompletionStream(w http.ResponseWriter, r *http.Request, req *harness.CompletionRequest) {
+	var completion *logger.ChatSession
+	if hnd.log != nil {
+		hnd.log.CompleteCall(req.Model, "http")
+		completion = hnd.log.NewCompletionSession(logger.NewChatID(req.Model), req.Model, nil, true)
+		completion.MarkEstimated()
+	}
+
 	tokenChan, err := hnd.h.StreamTokens(r.Context(), req)
 	if err != nil {
+		if completion != nil {
+			completion.Finish("error")
+		}
 		http.Error(w, fmt.Sprintf("streaming error: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -166,14 +188,19 @@ func (hnd *Handler) handleCompletionStream(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Connection", "keep-alive")
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		if completion != nil {
+			completion.Finish("error")
+		}
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
+	var out strings.Builder
 	for token := range tokenChan {
 		cleaned := stripStopTokens(token)
 		if cleaned == "" {
 			break
 		}
+		out.WriteString(cleaned)
 		chunk := map[string]interface{}{
 			"object": "text_completion",
 			"model":  req.Model,
@@ -184,6 +211,10 @@ func (hnd *Handler) handleCompletionStream(w http.ResponseWriter, r *http.Reques
 		data, _ := json.Marshal(chunk)
 		fmt.Fprintf(w, "data: %s\n\n", data)
 		flusher.Flush()
+	}
+	if completion != nil {
+		completion.RecordTurn(req.Prompt, out.String(), logger.EstimateTokens(req.Prompt), logger.EstimateTokens(out.String()), nil)
+		completion.Finish("stop")
 	}
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
@@ -252,7 +283,7 @@ func (hnd *Handler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	// ── Logging ───────────────────────────────────────────────────────────────
 	var chatSession *logger.ChatSession
 	if hnd.log != nil {
-		chatID := logger.NewChatID()
+		chatID := logger.NewChatID(req.Model)
 		var toolNames []string
 		if hnd.toolCfg != nil {
 			for _, t := range hnd.toolCfg.Tools {
@@ -481,6 +512,9 @@ func (hnd *Handler) handleStreamingNonLlamacpp(w http.ResponseWriter, r *http.Re
 	}
 	tokenChan, err := hnd.h.StreamChat(ctx, streamReq)
 	if err != nil {
+		if sess != nil {
+			sess.Finish("error")
+		}
 		http.Error(w, fmt.Sprintf("streaming error: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -539,6 +573,9 @@ func (hnd *Handler) handleStreamingToolLoop(w http.ResponseWriter, r *http.Reque
 	w.Header().Set("Connection", "keep-alive")
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		if sess != nil {
+			sess.Finish("error")
+		}
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
@@ -565,6 +602,9 @@ func (hnd *Handler) handleStreamingToolLoop(w http.ResponseWriter, r *http.Reque
 
 		tokenChan, err := hnd.h.StreamChat(ctx, chatReq)
 		if err != nil {
+			if sess != nil {
+				sess.Finish("error")
+			}
 			maybeSetToolHeader()
 			fmt.Fprintf(w, "data: {\"error\": %q}\n\n", err.Error())
 			flusher.Flush()
